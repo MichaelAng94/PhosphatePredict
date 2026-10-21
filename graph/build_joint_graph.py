@@ -10,6 +10,7 @@
 
 import os
 import re
+from pathlib import Path
 import torch
 import numpy as np
 import pandas as pd
@@ -18,14 +19,17 @@ from node2vec import Node2Vec
 from torch_geometric.data import HeteroData
 import logging
 
+# 以脚本位置定位项目根目录，从任意目录运行脚本时数据路径依然正确
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==================== 配置路径 ====================
-PPI_CSV = "PPI/kinase_ppi_network.csv"                      # 激酶-激酶 PPI
-KINASE_SUBSTRATE_CSV = "origin_data/kinase_substrate_pairs_detailed.csv"  # 激酶-底物关系
-SITE_FEATURE_DIR = "origin_data/substate"                   # 底物位点特征目录
-KINASE_FEATURE_DIRS = ["origin_data/kinase", "origin_data/kinase/out"]  # 激酶特征目录（ESM）
-OUTPUT_GRAPH = "origin_data/joint_hetero_graph.pt"
+PPI_CSV = str(PROJECT_ROOT / "PPI/kinase_ppi_network.csv")                      # 激酶-激酶 PPI
+KINASE_SUBSTRATE_CSV = str(PROJECT_ROOT / "origin_data/kinase_substrate_pairs_detailed.csv")  # 激酶-底物关系
+SITE_FEATURE_DIR = str(PROJECT_ROOT / "origin_data/substate")                   # 底物位点特征目录
+KINASE_FEATURE_DIRS = [str(PROJECT_ROOT / "origin_data/kinase"), str(PROJECT_ROOT / "origin_data/kinase/out")]  # 激酶特征目录（ESM）
+OUTPUT_GRAPH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph.pt")
 
 # Node2Vec 参数
 N2V_DIM = 128

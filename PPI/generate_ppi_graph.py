@@ -6,6 +6,8 @@
 输出：PPI/kinase_ppi_graph.pt （包含 x, edge_index, node_names, edge_scores 等）
 """
 
+from pathlib import Path
+
 import torch
 import pandas as pd
 import networkx as nx
@@ -13,8 +15,10 @@ from node2vec import Node2Vec
 from torch_geometric.data import Data
 
 # ==================== 1. 文件路径 ====================
-input_csv = "PPI/kinase_ppi_network.csv"
-output_pt = "PPI/kinase_ppi_graph.pt"
+# 以脚本位置定位项目根目录，从任意目录运行脚本时数据路径依然正确
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+input_csv = str(PROJECT_ROOT / "PPI/kinase_ppi_network.csv")
+output_pt = str(PROJECT_ROOT / "PPI/kinase_ppi_graph.pt")
 
 # ==================== 2. 加载边数据并构建NetworkX图 ====================
 print("正在加载边数据...")
@@ -78,7 +82,7 @@ torch.save(data, output_pt)
 print(f"图已保存至: {output_pt}")
 
 # 可选的：额外保存节点列表（方便其他工具使用）
-node_list_file = "PPI/kinase_node_list.txt"
+node_list_file = str(PROJECT_ROOT / "PPI/kinase_node_list.txt")
 with open(node_list_file, 'w') as f:
     for node in nodes:
         f.write(f"{node}\n")

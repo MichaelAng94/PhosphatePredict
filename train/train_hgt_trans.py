@@ -14,8 +14,10 @@
 """
 
 from collections import defaultdict
+from pathlib import Path
 
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -28,7 +30,12 @@ import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-# 导入模型
+# 直接运行 python3 train/train_hgt_trans.py 时 sys.path[0] 是 train/，
+# 需先把项目根目录加入 sys.path 才能导入 model 包
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from model.hgt_transformer import HGTTransformer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,8 +45,8 @@ plt.rcParams['axes.titlesize'] = 11
 
 # ==================== 配置参数 ====================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GRAPH_PATH = "origin_data/joint_hetero_graph.pt"
-KINASE_FAMILY_FILE = "origin_data/kinase_family.xls"   # 列名: Name, Family
+GRAPH_PATH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph.pt")
+KINASE_FAMILY_FILE = str(PROJECT_ROOT / "origin_data/kinase_family.xls")   # 列名: Name, Family
 
 LINK_PRED_BATCH_SIZE = 2000      # 每次采样多少正样本对
 NUM_NEG_SAMPLES = 5               # 每个正样本对应的负样本数（1:1 会高估 PR-AUC）
@@ -465,7 +472,7 @@ def main():
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
                 patience_counter = 0
-                torch.save(model.state_dict(), "model/best_joint_model.pt")
+                torch.save(model.state_dict(), str(PROJECT_ROOT / "model/best_joint_model.pt"))
                 logging.info(f"  -> 保存最佳模型 (Val AUC = {val_auc:.4f}, Val F1 = {results['val_f1']:.4f})")
             else:
                 patience_counter += 1
@@ -478,7 +485,7 @@ def main():
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 AUC: {best_val_auc:.4f}")
-    model.load_state_dict(torch.load("model/best_joint_model.pt", map_location=DEVICE))
+    model.load_state_dict(torch.load(str(PROJECT_ROOT / "model/best_joint_model.pt"), map_location=DEVICE))
     final_results = evaluate(
         model, train_data, kinase_labels, mask_dict, edge_dict,
         kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY
@@ -545,7 +552,7 @@ def main():
 
     # 保存高分辨率矢量图
     plt.tight_layout()
-    plt.savefig('figures/roc_curves.png', dpi=500, bbox_inches='tight')  # 可选
+    plt.savefig(str(PROJECT_ROOT / 'figures/roc_curves.png'), dpi=500, bbox_inches='tight')  # 可选
     plt.show()
 
 if __name__ == "__main__":

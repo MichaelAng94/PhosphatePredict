@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import requests
 import pandas as pd
 import time
@@ -8,8 +10,11 @@ SPECIES_ID = 9606              # 物种 ID，9606 代表人类 (Homo sapiens)
 REQUIRED_SCORE = 0             # 最小得分阈值 (0-1000)，0 代表获取所有结果
 REQUEST_DELAY = 1              # API 请求间隔（秒），避免请求过于频繁
 BATCH_SIZE = 100               # API 单次查询允许的最大蛋白数量
-INPUT_CSV = "origin_data/consolidated_all_kinases.csv"
-OUTPUT_CSV = "kinase_ppi_network.csv"
+# 以脚本位置定位项目根目录，从任意目录运行脚本时数据路径依然正确
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+INPUT_CSV = str(PROJECT_ROOT / "origin_data/consolidated_all_kinases.csv")
+# 输出固定到 PPI/ 目录，与 generate_ppi_graph.py、graph/build_joint_graph.py 的读取路径一致
+OUTPUT_CSV = str(PROJECT_ROOT / "PPI/kinase_ppi_network.csv")
 
 # ==================== 核心函数 ====================
 def read_kinases(csv_path: str) -> List[str]:
@@ -90,7 +95,7 @@ def main():
     if all_interactions:
         # 将 API 返回的 JSON 数据转换为 DataFrame，并精简列
         df = pd.DataFrame(all_interactions)
-        df.to_csv("raw_ppi_data.csv", index=False)  # 保存原始数据以供调试
+        df.to_csv(str(PROJECT_ROOT / "PPI/raw_ppi_data.csv"), index=False)  # 保存原始数据以供调试
         # 保留最关键的三列：蛋白A、蛋白B、综合得分
         result_df = df[['preferredName_A', 'preferredName_B', 'score']]
         result_df.to_csv(OUTPUT_CSV, index=False)
