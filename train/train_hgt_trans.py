@@ -191,6 +191,35 @@ def sample_link_prediction_pairs(edge_index_ks, num_kinase, num_site, num_neg=1,
     neg_s = torch.tensor(np.concatenate(neg_s_list), dtype=torch.long, device=device)
     return pos_k, pos_s, neg_k, neg_s
 
+def build_fixed_eval_pairs(edge_index, num_neg, num_kinase, num_site,
+                           kinase_sites, site_kinases, strategy, seed):
+    """
+    为一个评估边集预生成固定的正负样本对（消除评估噪声）：
+    - 正样本：该边集的全部边（不再随机抽样子集）
+    - 负样本：按 strategy 做 num_neg 次单侧破坏，经全量正边过滤
+    用独立 seed 生成后恢复全局随机状态，不影响训练期随机性。
+    返回: (pos_k, pos_s, neg_k, neg_s)，供 evaluate / get_link_pred_predictions 复用。
+    """
+    rng_state = np.random.get_state()
+    np.random.seed(seed)
+    try:
+        device = edge_index.device
+        pos_k_np = edge_index[0].cpu().numpy()
+        pos_s_np = edge_index[1].cpu().numpy()
+        neg_k_list, neg_s_list = [], []
+        for _ in range(num_neg):
+            nk, ns = _generate_negatives(pos_k_np, pos_s_np, num_kinase, num_site,
+                                         kinase_sites, site_kinases, strategy)
+            neg_k_list.append(nk)
+            neg_s_list.append(ns)
+        pos_k = torch.tensor(pos_k_np, dtype=torch.long, device=device)
+        pos_s = torch.tensor(pos_s_np, dtype=torch.long, device=device)
+        neg_k = torch.tensor(np.concatenate(neg_k_list), dtype=torch.long, device=device)
+        neg_s = torch.tensor(np.concatenate(neg_s_list), dtype=torch.long, device=device)
+    finally:
+        np.random.set_state(rng_state)
+    return pos_k, pos_s, neg_k, neg_s
+
 # ==================== 训练和评估函数（支持掩码）====================
 def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
                 optimizer, criterion_class, criterion_link, kinase_sites, site_kinases):
@@ -256,13 +285,16 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     return loss.item()
 
 def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
-             kinase_sites, site_kinases, num_neg_eval=5, neg_strategy="tail"):
+             kinase_sites, site_kinases, num_neg_eval=5, neg_strategy="tail",
+             fixed_pairs=None):
     """
     评估分类和链接预测性能。
     embed_data: 计算节点嵌入所用的图快照，必须只含训练边，
                 否则验证/测试边会泄漏进消息传递导致指标虚高。
     mask_dict: {'train': train_kinase_mask, 'val': val_kinase_mask, 'test': test_kinase_mask}
     edge_index_dict: {'train': train_edge_index, 'val': val_edge_index, 'test': test_edge_index}
+    fixed_pairs: 可选 {split: (pos_k, pos_s, neg_k, neg_s)}，预生成的固定评估样本；
+                 提供的 split 复用同一份样本（不再随机重采），指标跨轮可比
     """
     model.eval()
     with torch.no_grad():
@@ -290,12 +322,15 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
                 for key in ('auc', 'pr_auc', 'f1', 'acc_link', 'precision', 'recall'):
                     results[f'{split}_{key}'] = 0.0
                 continue
-            pos_k, pos_s, neg_k, neg_s = sample_link_prediction_pairs(
-                eidx, num_kinase, num_site, num_neg=num_neg_eval,
-                batch_size=min(1000, eidx.size(1)),
-                kinase_sites=kinase_sites, site_kinases=site_kinases,
-                strategy=neg_strategy,
-            )
+            if fixed_pairs is not None and split in fixed_pairs:
+                pos_k, pos_s, neg_k, neg_s = fixed_pairs[split]
+            else:
+                pos_k, pos_s, neg_k, neg_s = sample_link_prediction_pairs(
+                    eidx, num_kinase, num_site, num_neg=num_neg_eval,
+                    batch_size=min(1000, eidx.size(1)),
+                    kinase_sites=kinase_sites, site_kinases=site_kinases,
+                    strategy=neg_strategy,
+                )
             pos_pred = model.predict_interaction(kinase_emb, site_emb, pos_k, pos_s)
             neg_pred = model.predict_interaction(kinase_emb, site_emb, neg_k, neg_s)
             pred = torch.cat([pos_pred, neg_pred], dim=0).cpu().numpy()
@@ -313,7 +348,7 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
     return results
 
 def get_link_pred_predictions(model, embed_data, edge_index, kinase_sites, site_kinases,
-                              num_neg=10, strategy="tail"):
+                              num_neg=10, strategy="tail", fixed_pairs=None):
     """
     在给定的边集上进行链接预测，返回所有正负样本的预测概率和真实标签。
     嵌入由 embed_data（仅含训练边的图快照）计算；
@@ -323,6 +358,8 @@ def get_link_pred_predictions(model, embed_data, edge_index, kinase_sites, site_
         embed_data: 仅含训练边的图快照
         edge_index: 待评估的边索引 (2, E)
         num_neg: 每个正样本对应的负样本数 (建议设为 5~10 以获得稳定ROC)
+        fixed_pairs: 可选 (pos_k, pos_s, neg_k, neg_s)，提供时跳过内部采样
+                     （num_neg/strategy 被忽略），与 evaluate 共用同一份固定样本
     返回:
         preds: numpy array, 预测概率 (长度 E + E*num_neg)
         labels: numpy array, 真实标签 (1为正，0为负)
@@ -335,24 +372,26 @@ def get_link_pred_predictions(model, embed_data, edge_index, kinase_sites, site_
         site_emb = emb_dict['site']
         num_kinase, num_site = kinase_emb.size(0), site_emb.size(0)
 
-        pos_k = edge_index[0].cpu().numpy()
-        pos_s = edge_index[1].cpu().numpy()
+        if fixed_pairs is not None:
+            pos_k_t, pos_s_t, neg_k_t, neg_s_t = fixed_pairs
+        else:
+            pos_k = edge_index[0].cpu().numpy()
+            pos_s = edge_index[1].cpu().numpy()
+            pos_k_t = torch.tensor(pos_k, device=device, dtype=torch.long)
+            pos_s_t = torch.tensor(pos_s, device=device, dtype=torch.long)
 
-        pos_k_t = torch.tensor(pos_k, device=device, dtype=torch.long)
-        pos_s_t = torch.tensor(pos_s, device=device, dtype=torch.long)
+            neg_k_list, neg_s_list = [], []
+            for _ in range(num_neg):
+                nk, ns = _generate_negatives(pos_k, pos_s, num_kinase, num_site,
+                                             kinase_sites, site_kinases, strategy)
+                neg_k_list.append(nk)
+                neg_s_list.append(ns)
+            neg_k = np.concatenate(neg_k_list)
+            neg_s = np.concatenate(neg_s_list)
+            neg_k_t = torch.tensor(neg_k, device=device, dtype=torch.long)
+            neg_s_t = torch.tensor(neg_s, device=device, dtype=torch.long)
+
         pos_pred = model.predict_interaction(kinase_emb, site_emb, pos_k_t, pos_s_t).cpu().numpy()
-
-        neg_k_list, neg_s_list = [], []
-        for _ in range(num_neg):
-            nk, ns = _generate_negatives(pos_k, pos_s, num_kinase, num_site,
-                                         kinase_sites, site_kinases, strategy)
-            neg_k_list.append(nk)
-            neg_s_list.append(ns)
-        neg_k = np.concatenate(neg_k_list)
-        neg_s = np.concatenate(neg_s_list)
-
-        neg_k_t = torch.tensor(neg_k, device=device, dtype=torch.long)
-        neg_s_t = torch.tensor(neg_s, device=device, dtype=torch.long)
         neg_pred = model.predict_interaction(kinase_emb, site_emb, neg_k_t, neg_s_t).cpu().numpy()
 
         preds = np.concatenate([pos_pred, neg_pred])
@@ -476,6 +515,16 @@ def main():
     # 准备掩码字典和边字典供评估使用
     mask_dict = {'train': train_kinase_mask, 'val': val_kinase_mask, 'test': test_kinase_mask}
     edge_dict = {'train': train_edge_index, 'val': val_edge_index, 'test': test_edge_index}
+
+    # 固定评估负样本：val/test 各预生成一份（全部正边 + 固定负样本），每次评估复用，
+    # 消除随机重采导致的指标抖动；独立 seed + 状态恢复，不影响训练期随机性
+    fixed_eval_pairs = {}
+    for i, split in enumerate(('val', 'test')):
+        fixed_eval_pairs[split] = build_fixed_eval_pairs(
+            edge_dict[split], num_neg=5, num_kinase=num_kinase, num_site=num_site,
+            kinase_sites=kinase_sites, site_kinases=site_kinases,
+            strategy=NEG_STRATEGY, seed=RANDOM_SEED + 1000 + i,
+        )
     
     # logging.info("start training...")
     for epoch in range(1, EPOCHS+1):
@@ -488,7 +537,8 @@ def main():
         if epoch % 5 == 0:
             results = evaluate(
                 model, train_data, kinase_labels, mask_dict, edge_dict,
-                kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY
+                kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
+                fixed_pairs=fixed_eval_pairs
             )
             val_auc = results['val_auc']
             val_pr_auc = results['val_pr_auc']
@@ -519,7 +569,8 @@ def main():
     model.load_state_dict(torch.load(str(PROJECT_ROOT / "model/best_joint_model.pt"), map_location=DEVICE))
     final_results = evaluate(
         model, train_data, kinase_labels, mask_dict, edge_dict,
-        kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY
+        kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
+        fixed_pairs=fixed_eval_pairs
     )
     logging.info(
         f"最终测试集性能: "
@@ -535,9 +586,11 @@ def main():
     train_preds, train_labels = get_link_pred_predictions(
         model, train_data, train_edge_index, kinase_sites, site_kinases, num_neg=10, strategy=NEG_STRATEGY)
     val_preds, val_labels = get_link_pred_predictions(
-        model, train_data, val_edge_index, kinase_sites, site_kinases, num_neg=10, strategy=NEG_STRATEGY)
+        model, train_data, val_edge_index, kinase_sites, site_kinases,
+        num_neg=10, strategy=NEG_STRATEGY, fixed_pairs=fixed_eval_pairs['val'])
     test_preds, test_labels = get_link_pred_predictions(
-        model, train_data, test_edge_index, kinase_sites, site_kinases, num_neg=10, strategy=NEG_STRATEGY)
+        model, train_data, test_edge_index, kinase_sites, site_kinases,
+        num_neg=10, strategy=NEG_STRATEGY, fixed_pairs=fixed_eval_pairs['test'])
 
     # 计算 ROC 曲线和 AUC
     fpr_train, tpr_train, _ = roc_curve(train_labels, train_preds)
