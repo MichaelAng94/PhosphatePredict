@@ -57,7 +57,7 @@ LAMBDA_FAMILY = 0.5               # 分类损失权重
 LAMBDA_LINK = 1.0                 # 链接预测损失权重
 LAMBDA_RANK = 0.5                 # L3 排序损失权重（margin ranking，直接优化排序/AUC）
 RANKING_MARGIN = 1.0              # L3 排序损失间隔
-EDGE_DROP_RATIO = 0.2             # L1 冷启动模拟：每轮随机屏蔽的训练激酶比例（其磷酸化边只退出消息传递，仍计入损失）
+EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的训练激酶比例（其磷酸化边只退出消息传递，仍计入损失）
 LEARNING_RATE = 1e-4
 EPOCHS = 1000
 EARLY_STOPPING_PATIENCE = 20
@@ -499,7 +499,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.3,
+        dropout=0.2,
         motif_len=motif_len
     ).to(DEVICE)
     
@@ -553,7 +553,7 @@ def main():
             if val_pr_auc > best_val_auc:
                 best_val_auc = val_pr_auc
                 patience_counter = 0
-                torch.save(model.state_dict(), str(PROJECT_ROOT / "model/best_joint_model.pt"))
+                torch.save(model.state_dict(), str(PROJECT_ROOT / "model/best_joint_model_new.pt"))
                 logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1 = {results['val_f1']:.4f})")
             else:
                 patience_counter += 1
@@ -566,7 +566,7 @@ def main():
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
-    model.load_state_dict(torch.load(str(PROJECT_ROOT / "model/best_joint_model.pt"), map_location=DEVICE))
+    model.load_state_dict(torch.load(str(PROJECT_ROOT / "model/best_joint_model_new.pt"), map_location=DEVICE))
     final_results = evaluate(
         model, train_data, kinase_labels, mask_dict, edge_dict,
         kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
