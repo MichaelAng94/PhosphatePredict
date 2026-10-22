@@ -499,7 +499,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.2,
+        dropout=0.3,
         motif_len=motif_len
     ).to(DEVICE)
     
