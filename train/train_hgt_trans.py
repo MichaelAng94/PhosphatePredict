@@ -20,6 +20,7 @@ import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import pandas as pd
@@ -54,6 +55,9 @@ SPLIT_MODE = "kinase"             # "kinase": 按激酶整体留出(cold-start) 
 NEG_STRATEGY = "tail"             # "tail": 保留激酶替换位点 | "head": 保留位点替换激酶 | "mixed": 各半
 LAMBDA_FAMILY = 0.5               # 分类损失权重
 LAMBDA_LINK = 1.0                 # 链接预测损失权重
+LAMBDA_RANK = 0.5                 # L3 排序损失权重（margin ranking，直接优化排序/AUC）
+RANKING_MARGIN = 1.0              # L3 排序损失间隔
+EDGE_DROP_RATIO = 0.2             # L1 冷启动模拟：每轮随机屏蔽的训练激酶比例（其磷酸化边只退出消息传递，仍计入损失）
 LEARNING_RATE = 1e-4
 EPOCHS = 1000
 EARLY_STOPPING_PATIENCE = 20
@@ -193,13 +197,30 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     model.train()
     optimizer.zero_grad()
 
-    # 前向传播得到嵌入（data 为仅含训练边的图快照）
+    # L1 冷启动模拟：随机选一部分训练激酶，把它们的磷酸化边（正向+反向）
+    # 从消息传递图快照中临时移除（PPI 边保留）。这些边仍参与下面的链接损失，
+    # 迫使模型仅凭输入特征（ESM/n2v/motif）为这些激酶打分——即验证/测试的推理模式
+    phos_key = ('kinase', 'phosphorylates', 'site')
+    rev_key = ('site', 'rev_phosphorylates', 'kinase')
+    orig_phos_ei = data[phos_key].edge_index
+    orig_rev_ei = data[rev_key].edge_index if rev_key in data.edge_types else None
+    if EDGE_DROP_RATIO > 0:
+        num_k = data['kinase'].esm_x.size(0)
+        drop_k = torch.randperm(num_k, device=orig_phos_ei.device)[:int(EDGE_DROP_RATIO * num_k)]
+        data[phos_key].edge_index = orig_phos_ei[:, ~torch.isin(orig_phos_ei[0], drop_k)]
+        if orig_rev_ei is not None:
+            data[rev_key].edge_index = orig_rev_ei[:, ~torch.isin(orig_rev_ei[1], drop_k)]
+
     emb_dict = model(data)   # {'kinase': [K, H], 'site': [S, H]}
+    data[phos_key].edge_index = orig_phos_ei   # 立即恢复，保证评估用的图快照不受影响
+    if orig_rev_ei is not None:
+        data[rev_key].edge_index = orig_rev_ei
     kinase_emb = emb_dict['kinase']
     site_emb = emb_dict['site']
 
     # 1. 激酶家族分类损失（仅对训练集中的有标签激酶）
     family_logits = model.predict_family(kinase_emb)   # [K, num_families]
+    fam_probs = torch.softmax(family_logits, dim=-1)   # 复用给 A1 家族原型先验分支
     mask = (kinase_labels != -1) & train_kinase_mask
     if mask.sum() > 0:
         loss_family = criterion_class(family_logits[mask], kinase_labels[mask])
@@ -214,13 +235,22 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         num_neg=NUM_NEG_SAMPLES, batch_size=LINK_PRED_BATCH_SIZE,
         kinase_sites=kinase_sites, site_kinases=site_kinases, strategy=NEG_STRATEGY
     )
-    pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s)
-    neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s)
+    pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s, fam_probs=fam_probs)
+    neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s, fam_probs=fam_probs)
     pred = torch.cat([pos_logits, neg_logits], dim=0)
     label = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)]).float()
     loss_link = criterion_link(pred, label)
 
-    loss = LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link
+    # 3. L3 排序损失：同一激酶的正样本 logit 应比其负样本 logit 高出至少 margin。
+    # 负样本按 [每个正样本 num_neg 条、与正样本同序] 排列，可按索引直接配对
+    n_pos = pos_logits.size(0)
+    neg_sel_idx = (
+        torch.arange(n_pos, device=pos_logits.device) * NUM_NEG_SAMPLES
+        + torch.randint(0, NUM_NEG_SAMPLES, (n_pos,), device=pos_logits.device)
+    )
+    loss_rank = F.relu(RANKING_MARGIN - pos_logits + neg_logits[neg_sel_idx]).mean()
+
+    loss = LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link + LAMBDA_RANK * loss_rank
     loss.backward()
     optimizer.step()
     return loss.item()

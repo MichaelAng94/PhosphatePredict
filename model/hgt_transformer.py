@@ -127,6 +127,12 @@ class HGTTransformer(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
+        # A1 家族原型先验分支：family_prototypes 第 f 行 = 家族 f 的 motif 偏好向量。
+        # 参数全家族共享（C×H，无逐激酶自由度），结构上无法记忆单个激酶；
+        # prior_weight 为先验融合权重，初始 0 → 训练起点与原模型完全等价，信任程度由梯度自学
+        self.family_prototypes = nn.Parameter(torch.randn(num_families, hidden_dim) * 0.02)
+        self.prior_weight = nn.Parameter(torch.tensor(0.0))
+
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
 
@@ -138,14 +144,25 @@ class HGTTransformer(nn.Module):
         return self.family_classifier(kinase_emb)
 
     def interaction_logits(self, kinase_emb: torch.Tensor, site_emb: torch.Tensor,
-                           k_idx, s_idx) -> torch.Tensor:
+                           k_idx, s_idx, fam_probs=None) -> torch.Tensor:
         """
         返回激酶-位点对的原始打分 [B]（供 BCEWithLogitsLoss 使用）。
+        总分 = 交互 MLP 主分支 + prior_weight · 家族原型先验（A1）：
+        pref = 家族概率 @ 原型矩阵，再与位点嵌入做缩放点积。
+        fam_probs 可传入训练时已算好的 softmax 家族概率 [K, C]（避免重复计算、
+        保证正负样本用同一组概率）；缺省时在内部计算（评估路径）。
         """
         k_emb = kinase_emb[k_idx]   # [B, H]
         s_emb = site_emb[s_idx]     # [B, H]
         feats = torch.cat([k_emb, s_emb, k_emb * s_emb, (k_emb - s_emb).abs()], dim=-1)
-        return self.interaction_mlp(feats).squeeze(-1)   # [B]
+        main_logits = self.interaction_mlp(feats).squeeze(-1)   # [B]
+
+        # A1 先验分支：家族概率软混合原型偏好，与位点嵌入做缩放点积（/√d 控制量级）
+        if fam_probs is None:
+            fam_probs = torch.softmax(self.predict_family(kinase_emb), dim=-1)  # [K, C]
+        pref = fam_probs @ self.family_prototypes                                   # [K, H]
+        prior_logits = (pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)  # [B]
+        return main_logits + self.prior_weight * prior_logits
 
     def predict_interaction(self, kinase_emb: torch.Tensor, site_emb: torch.Tensor,
                             k_idx, s_idx) -> torch.Tensor:
