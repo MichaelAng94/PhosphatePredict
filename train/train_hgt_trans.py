@@ -39,24 +39,24 @@ if str(PROJECT_ROOT) not in sys.path:
 from model.hgt_transformer import HGTTransformer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
 plt.rcParams['font.size'] = 11
 plt.rcParams['axes.titlesize'] = 11
 
 # ==================== 配置参数 ====================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GRAPH_PATH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph.pt")
+GRAPH_PATH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph_motif.pt")
 KINASE_FAMILY_FILE = str(PROJECT_ROOT / "origin_data/kinase_family.xls")   # 列名: Name, Family
 
 LINK_PRED_BATCH_SIZE = 2000      # 每次采样多少正样本对
 NUM_NEG_SAMPLES = 5               # 每个正样本对应的负样本数（1:1 会高估 PR-AUC）
 SPLIT_MODE = "kinase"             # "kinase": 按激酶整体留出(cold-start) | "edge": 按边随机划分(对照)
 NEG_STRATEGY = "tail"             # "tail": 保留激酶替换位点 | "head": 保留位点替换激酶 | "mixed": 各半
-# LAMBDA_FAMILY = 1.0               # 分类损失权重
-# LAMBDA_LINK = 1.0                 # 链接预测损失权重
+LAMBDA_FAMILY = 0.5               # 分类损失权重
+LAMBDA_LINK = 1.0                 # 链接预测损失权重
 LEARNING_RATE = 1e-4
 EPOCHS = 1000
-EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_PATIENCE = 20
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -199,12 +199,12 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     site_emb = emb_dict['site']
 
     # 1. 激酶家族分类损失（仅对训练集中的有标签激酶）
-    # family_logits = model.predict_family(kinase_emb)   # [K, num_families]
-    # mask = (kinase_labels != -1) & train_kinase_mask
-    # if mask.sum() > 0:
-    #     loss_family = criterion_class(family_logits[mask], kinase_labels[mask])
-    # else:
-    #     loss_family = torch.tensor(0.0, device=DEVICE)
+    family_logits = model.predict_family(kinase_emb)   # [K, num_families]
+    mask = (kinase_labels != -1) & train_kinase_mask
+    if mask.sum() > 0:
+        loss_family = criterion_class(family_logits[mask], kinase_labels[mask])
+    else:
+        loss_family = torch.tensor(0.0, device=DEVICE)
 
     # 2. 链接预测损失（训练边 + 单侧破坏负样本，负样本经全量正边过滤）
     num_kinase = kinase_emb.size(0)
@@ -220,10 +220,10 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     label = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)]).float()
     loss_link = criterion_link(pred, label)
 
-    # loss = lambda_family * loss_family + lambda_link * loss_link
-    loss_link.backward()
+    loss = LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link
+    loss.backward()
     optimizer.step()
-    return loss_link.item()
+    return loss.item()
 
 def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
              kinase_sites, site_kinases, num_neg_eval=5, neg_strategy="tail"):
