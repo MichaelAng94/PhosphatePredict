@@ -515,7 +515,7 @@ def main():
                 logging.info(f"Epoch {epoch:03d} | Loss: {loss:.4f}")
     
     # 加载最佳模型并在测试集上评估
-    logging.info(f"训练完成，最佳验证集 AUC: {best_val_auc:.4f}")
+    logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
     model.load_state_dict(torch.load(str(PROJECT_ROOT / "model/best_joint_model.pt"), map_location=DEVICE))
     final_results = evaluate(
         model, train_data, kinase_labels, mask_dict, edge_dict,

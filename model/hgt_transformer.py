@@ -23,6 +23,7 @@ class SiteMotifEncoder(nn.Module):
             nhead=num_heads,
             dim_feedforward=hidden_dim * 2,
             dropout=dropout,
+            activation='gelu',
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
@@ -105,6 +106,7 @@ class HGTTransformer(nn.Module):
             nhead=num_heads,
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
+            activation='gelu',
             batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(
@@ -113,7 +115,7 @@ class HGTTransformer(nn.Module):
         # 激酶家族分类器（MLP）
         self.family_classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_families)
         )
@@ -122,7 +124,7 @@ class HGTTransformer(nn.Module):
         # 比可对角加权点积(DistMut式)表达力更强，能建模非对称的激酶-位点交互
         self.interaction_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
@@ -202,9 +204,10 @@ class HGTTransformer(nn.Module):
 
         # 2. HGT 消息传递
         x_dict = {'kinase': kinase_x, 'site': site_x}
+        # HGT 后用 GELU（平滑、小负值不归零，缓解 3 层无残差结构下的 dead-ReLU）
         for hgt_layer in self.hgt_layers:
             x_dict = hgt_layer(x_dict, data.edge_index_dict)
-            x_dict = {k: F.relu(v) for k, v in x_dict.items()}
+            x_dict = {k: F.gelu(v) for k, v in x_dict.items()}
             x_dict = {k: self.dropout(v) for k, v in x_dict.items()}
 
         # 3. 融合所有节点表示（kinase + site）进行 Transformer 全局建模
