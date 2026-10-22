@@ -461,6 +461,7 @@ def main():
                 kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY
             )
             val_auc = results['val_auc']
+            val_pr_auc = results['val_pr_auc']
             logging.info(
                 f"Epoch {epoch:03d} | Loss: {loss:.4f} | "
                 f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f} | "
@@ -469,11 +470,11 @@ def main():
             )
             
             # 早停（基于验证集 AUC）
-            if val_auc > best_val_auc:
-                best_val_auc = val_auc
+            if val_pr_auc > best_val_auc:
+                best_val_auc = val_pr_auc
                 patience_counter = 0
                 torch.save(model.state_dict(), str(PROJECT_ROOT / "model/best_joint_model.pt"))
-                logging.info(f"  -> 保存最佳模型 (Val AUC = {val_auc:.4f}, Val F1 = {results['val_f1']:.4f})")
+                logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1 = {results['val_f1']:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= EARLY_STOPPING_PATIENCE:
