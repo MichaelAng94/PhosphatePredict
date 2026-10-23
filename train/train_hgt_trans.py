@@ -18,6 +18,7 @@ from pathlib import Path
 
 import os
 import sys
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import roc_auc_score, accuracy_score, auc, roc_curve, f1_score, precision_score, recall_score, average_precision_score
+from sklearn.metrics import roc_auc_score, accuracy_score, auc, roc_curve, f1_score, precision_score, recall_score, average_precision_score, precision_recall_curve
 import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -71,6 +72,39 @@ EARLY_STOPPING_PATIENCE = 30
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
+
+# ==================== checkpoint 安全读写 ====================
+# WSL 下写 /mnt/d（Windows 盘）时，.pt 文件可能被 Windows 侧瞬时占用
+# （Defender 实时扫描 / 同步盘 / 备份），直接 torch.save 会偶发 "cannot be opened"。
+CKPT_PATH = str(PROJECT_ROOT / "model/best_joint_model_new.pt")
+
+def save_checkpoint(model, path=CKPT_PATH, retries=5):
+    """先写 .tmp 再 os.replace 原子替换（避免半写损坏已有最佳模型）；
+    瞬时占用时退避重试；彻底失败不抛异常——训练继续，下个最佳 epoch 会再试。"""
+    tmp = path + '.tmp'
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for attempt in range(1, retries + 1):
+        try:
+            torch.save(model.state_dict(), tmp)
+            os.replace(tmp, path)
+            return True
+        except Exception as e:
+            logging.warning(f"checkpoint 保存失败（第 {attempt}/{retries} 次）: {e}")
+            if attempt < retries:
+                time.sleep(1.0 * attempt)
+    logging.error("checkpoint 保存彻底失败，本轮跳过（训练继续）")
+    return False
+
+def load_checkpoint(path=CKPT_PATH, retries=5):
+    """读取 checkpoint，带退避重试（应对瞬时占用）。"""
+    for attempt in range(1, retries + 1):
+        try:
+            return torch.load(path, map_location=DEVICE)
+        except Exception as e:
+            logging.warning(f"checkpoint 读取失败（第 {attempt}/{retries} 次）: {e}")
+            if attempt < retries:
+                time.sleep(1.0 * attempt)
+    raise RuntimeError(f"无法读取 checkpoint: {path}")
 
 # ==================== 加载数据 ====================
 def load_kinase_family_labels(kinase_nodes, family_file):
@@ -402,7 +436,7 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
 
 def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
              kinase_sites, site_kinases, num_neg_eval=5, neg_strategy="tail",
-             fixed_pairs=None):
+             fixed_pairs=None, threshold=0.5):
     """
     评估分类和链接预测性能。
     embed_data: 计算节点嵌入所用的图快照，必须只含训练边，
@@ -453,7 +487,7 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
             label = np.concatenate([np.ones(len(pos_pred)), np.zeros(len(neg_pred))])
             auc = roc_auc_score(label, pred)
             pr_auc = average_precision_score(label, pred)
-            pred_labels = (pred >= 0.5).astype(int)
+            pred_labels = (pred >= threshold).astype(int)
 
             results[f'{split}_auc'] = auc
             results[f'{split}_pr_auc'] = pr_auc
@@ -513,6 +547,13 @@ def get_link_pred_predictions(model, embed_data, edge_index, kinase_sites, site_
         preds = np.concatenate([pos_pred, neg_pred])
         labels = np.concatenate([np.ones_like(pos_pred), np.zeros_like(neg_pred)])
     return preds, labels
+
+def select_best_f1_threshold(labels, preds):
+    """在全部候选阈值中选 F1 最优（precision_recall_curve 一次遍历所有阈值）。"""
+    precision, recall, thr = precision_recall_curve(labels, preds)
+    f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-12)
+    i = int(np.argmax(f1[:-1]))          # f1 末位无对应阈值，排除
+    return float(thr[i]), float(f1[i])
     
 # ==================== 主程序 ====================
 def main():
@@ -702,7 +743,7 @@ def main():
             if val_pr_auc > best_val_auc:
                 best_val_auc = val_pr_auc
                 patience_counter = 0
-                torch.save(model.state_dict(), str(PROJECT_ROOT / "model/best_joint_model_new.pt"))
+                save_checkpoint(model)
                 logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1 = {results['val_f1']:.4f})")
             else:
                 patience_counter += 1
@@ -715,17 +756,24 @@ def main():
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
-    model.load_state_dict(torch.load(str(PROJECT_ROOT / "model/best_joint_model_new.pt"), map_location=DEVICE))
+    model.load_state_dict(load_checkpoint())
+    # 阈值校准：L4/难负样本压缩了 logit 量纲，0.5 不再对应判别边界（F1 会塌到 0）；
+    # 在 val 固定样本上选最优 F1 阈值，测试集用同一阈值报告（阈值不接触测试数据）
+    val_preds_cal, val_labels_cal = get_link_pred_predictions(
+        model, train_data, val_edge_index, kinase_sites, site_kinases,
+        num_neg=10, strategy=NEG_STRATEGY, fixed_pairs=fixed_eval_pairs['val'])
+    best_thr, val_f1_opt = select_best_f1_threshold(val_labels_cal, val_preds_cal)
+    logging.info(f"阈值校准: val 最优 F1 = {val_f1_opt:.4f} @ 阈值 {best_thr:.4f}")
     final_results = evaluate(
         model, train_data, kinase_labels, mask_dict, edge_dict,
         kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
-        fixed_pairs=fixed_eval_pairs
+        fixed_pairs=fixed_eval_pairs, threshold=best_thr
     )
     logging.info(
         f"最终测试集性能: "
         f"Link AUC = {final_results['test_auc']:.4f}, "
         f"PR-AUC = {final_results['test_pr_auc']:.4f}, "
-        f"Link F1 = {final_results['test_f1']:.4f}, "
+        f"Link F1 = {final_results['test_f1']:.4f}（阈值 {best_thr:.4f}，由 val 校准）, "
         f"Link Acc = {final_results['test_acc_link']:.4f}, "
         f"Precision = {final_results['test_precision']:.4f}, "
         f"Recall = {final_results['test_recall']:.4f}"

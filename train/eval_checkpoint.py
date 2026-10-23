@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 from sklearn.model_selection import train_test_split
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +30,7 @@ for p in (str(PROJECT_ROOT), str(Path(__file__).resolve().parent)):
 from train_hgt_trans import (
     DEVICE, GRAPH_PATH, KINASE_FAMILY_FILE, RANDOM_SEED, NEG_STRATEGY,
     load_kinase_family_labels, build_true_edge_maps, build_fixed_eval_pairs,
+    select_best_f1_threshold,
 )
 from model.hgt_transformer import HGTTransformer
 
@@ -89,11 +90,13 @@ def build_protocol():
 
 
 def eval_checkpoint(model, ckpt_path, train_data, fixed_pairs):
-    """加载单个 checkpoint，在同一份固定样本上计算 Val/Test AUC 与 PR-AUC。"""
+    """加载单个 checkpoint，在同一份固定样本上计算 Val/Test AUC、PR-AUC
+    与 val 校准阈值的 F1（阈值只从 val 选，test 复用同一阈值）。"""
     state = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(state)
     model.eval()
     out = {}
+    split_preds = {}
     with torch.no_grad():
         emb = model(train_data)
         k_emb, s_emb = emb['kinase'], emb['site']
@@ -105,6 +108,12 @@ def eval_checkpoint(model, ckpt_path, train_data, fixed_pairs):
             label = np.concatenate([np.ones(len(pos_pred)), np.zeros(len(neg_pred))])
             out[f'{split}_auc'] = roc_auc_score(label, pred)
             out[f'{split}_pr_auc'] = average_precision_score(label, pred)
+            split_preds[split] = (pred, label)
+    thr, _ = select_best_f1_threshold(split_preds['val'][1], split_preds['val'][0])
+    for split in ('val', 'test'):
+        pred, label = split_preds[split]
+        out[f'{split}_f1'] = f1_score(label, (pred >= thr).astype(int), zero_division=0)
+    out['threshold'] = thr
     return out
 
 
@@ -123,16 +132,18 @@ def main():
         motif_len=motif_len,
     ).to(DEVICE)
 
-    print(f"\n{'checkpoint':<40} {'Val AUC':>8} {'Val PR-AUC':>10} {'Test AUC':>9} {'Test PR-AUC':>11}")
-    print("-" * 82)
+    print(f"\n{'checkpoint':<40} {'Val AUC':>8} {'Val PR':>8} {'Val F1*':>8} "
+          f"{'Test AUC':>9} {'Test PR':>8} {'Test F1*':>8} {'thr':>7}")
+    print("-" * 102)
     for path in ckpt_paths:
         try:
             r = eval_checkpoint(model, path, train_data, fixed_pairs)
         except Exception as e:
             print(f"{Path(path).name:<40} 加载/评估失败: {e}")
             continue
-        print(f"{Path(path).name:<40} {r['val_auc']:>8.4f} {r['val_pr_auc']:>10.4f} "
-              f"{r['test_auc']:>9.4f} {r['test_pr_auc']:>11.4f}")
+        print(f"{Path(path).name:<40} {r['val_auc']:>8.4f} {r['val_pr_auc']:>8.4f} {r['val_f1']:>8.4f} "
+              f"{r['test_auc']:>9.4f} {r['test_pr_auc']:>8.4f} {r['test_f1']:>8.4f} {r['threshold']:>7.4f}")
+    print("F1* = 阈值由 val 校准后复用到 test（阈值不接触测试数据）")
 
 
 if __name__ == "__main__":
