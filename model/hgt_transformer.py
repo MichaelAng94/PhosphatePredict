@@ -75,6 +75,8 @@ class HGTTransformer(nn.Module):
         dropout: float = 0.2,
         motif_len: int = 0,              # 序列窗口长度；0 表示不使用 motif 特征
         motif_vocab: int = 21,           # 0=填充/未知, 1..20=标准氨基酸
+        num_groups: int = 0,             # P2-B2 大组数；0 表示不启用大组层级
+        family_group_map: torch.Tensor = None,   # [num_families, num_groups] one-hot
     ):
         super().__init__()
         self.motif_len = motif_len
@@ -94,6 +96,7 @@ class HGTTransformer(nn.Module):
             ['kinase', 'site'],
             [
                 ('kinase', 'ppis', 'kinase'),
+                ('kinase', 'similar_to', 'kinase'),
                 ('kinase', 'phosphorylates', 'site'),
                 ('site', 'rev_phosphorylates', 'kinase'),
             ]
@@ -145,6 +148,12 @@ class HGTTransformer(nn.Module):
         # prior_weight 为先验融合权重，初始 0 → 训练起点与原模型完全等价，信任程度由梯度自学
         self.family_prototypes = nn.Parameter(torch.randn(num_families, hidden_dim) * 0.02)
         self.prior_weight = nn.Parameter(torch.tensor(0.0))
+        # P2-B2 大组层级原型（同组家族共享质心，统计强度高于逐家族原型）
+        self.num_groups = num_groups
+        if num_groups > 0 and family_group_map is not None:
+            self.register_buffer('family_group_map', family_group_map.float())
+            self.group_prototypes = nn.Parameter(torch.randn(num_groups, hidden_dim) * 0.02)
+            self.group_prior_weight = nn.Parameter(torch.tensor(0.0))
 
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
@@ -175,7 +184,12 @@ class HGTTransformer(nn.Module):
             fam_probs = torch.softmax(self.predict_family(kinase_emb), dim=-1)  # [K, C]
         pref = fam_probs @ self.family_prototypes                                   # [K, H]
         prior_logits = (pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)  # [B]
-        return main_logits + self.prior_weight * prior_logits
+        out = main_logits + self.prior_weight * prior_logits
+        if self.num_groups > 0 and hasattr(self, 'group_prototypes'):
+            # P2-B2 大组级先验：大组质心统计更稳，作为家族先验的粗粒度补充
+            g_pref = (fam_probs @ self.family_group_map) @ self.group_prototypes    # [K, H]
+            out = out + self.group_prior_weight * (g_pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)
+        return out
 
     def predict_interaction(self, kinase_emb: torch.Tensor, site_emb: torch.Tensor,
                             k_idx, s_idx) -> torch.Tensor:

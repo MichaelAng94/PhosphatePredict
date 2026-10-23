@@ -65,6 +65,11 @@ DEGREE_ALPHA = 0.5                # 激酶均衡采样: 正边采样权重 ∝ 1
 LAMBDA_NCE = 0.5                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
+STEPS_PER_EPOCH = 6              # A: 每 epoch 采样+梯度更新次数（L1 边丢弃随每次采样刷新，等效步数 ×K）
+# ---- P2 结构改造 ----
+ESM_KNN_K = 5                    # B1: ESM-kNN 相似激酶边（每个激酶 top-K 序列相似邻居）
+NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
+LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 LEARNING_RATE = 9e-5
 EPOCHS = 2000
 EARLY_STOPPING_PATIENCE = 30
@@ -138,6 +143,55 @@ def load_kinase_family_labels(kinase_nodes, family_file):
     num_classes = len(families)
     logging.info(f"激酶家族类别数: {num_classes}, 有标签的激酶数: {(labels != -1).sum().item()}")
     return labels, num_classes
+
+def add_esm_knn_edges(data, k=5):
+    """P2-B1: 用 ESM 余弦相似度为激酶加 similar_to 边（top-k 邻居，对称化去重）。
+    仅用序列特征、无任何标注泄漏——冷启动激酶经此从相似训练激酶继承底物特异性。
+    k<=0 时写入空边集以保持图结构与模型 metadata 一致。返回边数。"""
+    esm = data['kinase'].esm_x
+    n = esm.size(0)
+    if k <= 0 or n <= 1:
+        data['kinase', 'similar_to', 'kinase'].edge_index = torch.zeros(2, 0, dtype=torch.long, device=esm.device)
+        return 0
+    esm_n = torch.nn.functional.normalize(esm, dim=-1)
+    sim = esm_n @ esm_n.t()
+    sim.fill_diagonal_(-1.0)
+    topi = sim.topk(min(k, n - 1), dim=-1).indices
+    src = torch.arange(n, device=esm.device).repeat_interleave(topi.size(1))
+    dst = topi.reshape(-1)
+    ei = torch.cat([torch.stack([src, dst]), torch.stack([dst, src])], dim=1)
+    ei = torch.unique(ei, dim=1)
+    data['kinase', 'similar_to', 'kinase'].edge_index = ei
+    return ei.size(1)
+
+def build_family_groups(data, kinase_labels, num_families, num_groups, seed):
+    """P2-B2: 家族→大组映射（KMeans 聚类家族 ESM 质心，适配任意家族命名体系）。
+    返回 (group_labels: [num_kinase] long，无家族标签为 -1；
+          family_group_map: [num_families, G] one-hot float，G 为实际大组数)。"""
+    from sklearn.cluster import KMeans
+    esm_np = data['kinase'].esm_x.cpu().numpy()
+    lab_np = kinase_labels.cpu().numpy()
+    centroids = np.zeros((num_families, esm_np.shape[1]), dtype=np.float64)
+    counts = np.zeros(num_families)
+    for f in range(num_families):
+        m = lab_np == f
+        if m.any():
+            centroids[f] = esm_np[m].mean(0)
+            counts[f] = m.sum()
+    present = np.where(counts > 0)[0]
+    absent = np.where(counts == 0)[0]
+    g = min(num_groups, len(present))
+    km = KMeans(n_clusters=g, random_state=seed, n_init=10)
+    family_to_group = np.zeros(num_families, dtype=np.int64)
+    family_to_group[present] = km.fit_predict(centroids[present])
+    if len(absent):   # 图中无成员的家族：softmax 仍会给微小概率，指到余弦最近大组质心
+        cn = centroids / np.maximum(np.linalg.norm(centroids, axis=1, keepdims=True), 1e-8)
+        kn = km.cluster_centers_ / np.maximum(np.linalg.norm(km.cluster_centers_, axis=1, keepdims=True), 1e-8)
+        family_to_group[absent] = (cn[absent] @ kn.T).argmax(1)
+    group_labels = np.where(lab_np >= 0, family_to_group[np.maximum(lab_np, 0)], -1)
+    gmap = torch.zeros(num_families, g)
+    gmap[torch.arange(num_families), torch.from_numpy(family_to_group)] = 1.0
+    return torch.from_numpy(group_labels).long(), gmap
 
 def build_true_edge_maps(full_edge_index):
     """
@@ -428,15 +482,23 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
             + F.cross_entropy(pair_logits.t() / NCE_TEMP, tgt)
         )
 
+    # P2-B2: 大组辅助分类损失（~12 大组 vs 130 细家族，每大组样本多得多，统计更稳）
+    loss_group = torch.tensor(0.0, device=pos_logits.device)
+    if hard_ctx is not None and 'group_labels' in hard_ctx:
+        g_logits = family_logits @ hard_ctx['family_group_map']
+        gmask = (hard_ctx['group_labels'] != -1) & train_kinase_mask
+        if gmask.any():
+            loss_group = criterion_class(g_logits[gmask], hard_ctx['group_labels'][gmask])
+
     loss = (LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link
-            + LAMBDA_RANK * loss_rank + LAMBDA_NCE * loss_nce)
+            + LAMBDA_RANK * loss_rank + LAMBDA_NCE * loss_nce + LAMBDA_GROUP * loss_group)
     loss.backward()
     optimizer.step()
     return loss.item()
 
 def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
              kinase_sites, site_kinases, num_neg_eval=5, neg_strategy="tail",
-             fixed_pairs=None, threshold=0.5):
+             fixed_pairs=None, threshold=0.5, group_labels=None):
     """
     评估分类和链接预测性能。
     embed_data: 计算节点嵌入所用的图快照，必须只含训练边，
@@ -463,6 +525,9 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
             else:
                 acc = 0.0
             results[f'{split}_acc'] = acc
+            if group_labels is not None and getattr(model, 'num_groups', 0) > 0:
+                g_pred = (family_logits @ model.family_group_map)[valid_mask].argmax(dim=1)
+                results[f'{split}_group_acc'] = (g_pred == group_labels[valid_mask]).float().mean().item()
 
         # 链接预测 AUC（对每个边集采样评估；负样本与训练使用同一策略和过滤规则）
         num_kinase = kinase_emb.size(0)
@@ -631,6 +696,15 @@ def main():
         test_edge_index = full_edge_index[:, test_edge_idx]
         logging.info(f"链接预测 - 按边划分: 训练边: {train_edge_index.size(1)}, 验证边: {val_edge_index.size(1)}, 测试边: {test_edge_index.size(1)}")
     
+    # P2-B1: ESM-kNN 相似激酶边（仅用序列特征，无标注泄漏），必须在 clone 前加到 data：
+    # 冷启动激酶经此从序列相似的训练激酶继承底物特异性
+    num_sim_edges = add_esm_knn_edges(data, ESM_KNN_K)
+    logging.info(f"P2-B1: ESM-kNN 相似激酶边 {num_sim_edges} 条（top-{ESM_KNN_K}，对称去重后）")
+    # P2-B2: 家族→大组层级（KMeans 聚类家族 ESM 质心，适配任意家族命名体系）
+    group_labels, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
+    group_labels = group_labels.to(DEVICE)
+    logging.info(f"P2-B2: {num_families} 个家族聚为 {int(family_group_map.size(1))} 个大组")
+
     train_data = data.clone()
     train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
     train_data['site', 'rev_phosphorylates', 'kinase'].edge_index = train_edge_index[[1,0]]
@@ -657,7 +731,9 @@ def main():
         num_hgt_layers=2,
         num_transformer_layers=1,
         dropout=0.3,
-        motif_len=motif_len
+        motif_len=motif_len,
+        num_groups=int(family_group_map.size(1)),
+        family_group_map=family_group_map,
     ).to(DEVICE)
     
     # 6. 损失函数与优化器
@@ -699,6 +775,8 @@ def main():
         'site_protein': site_protein,
         'protein_sites': dict(protein_sites),
         'true_edge_keys': true_edge_keys,
+        'group_labels': group_labels,
+        'family_group_map': family_group_map.to(DEVICE),
     }
     logging.info(
         f"P1 难负上下文: 有家族标签激酶 {sum(len(v) for v in family_kinases.values())}, "
@@ -717,24 +795,29 @@ def main():
     
     # logging.info("start training...")
     for epoch in range(1, EPOCHS+1):
-        loss = train_epoch(
-            model, train_data, kinase_labels, train_kinase_mask, train_edge_index,
-            optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
-            hard_ctx=hard_ctx, edge_weights=train_edge_weights
-        )
+        # A: 每 epoch 采样+更新 K 次（L1 边丢弃随每次采样刷新），等效优化步数 ×K
+        loss = sum(
+            train_epoch(
+                model, train_data, kinase_labels, train_kinase_mask, train_edge_index,
+                optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
+                hard_ctx=hard_ctx, edge_weights=train_edge_weights
+            )
+            for _ in range(STEPS_PER_EPOCH)
+        ) / STEPS_PER_EPOCH
         
         # 每 5 个 epoch 评估一次（嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）
         if epoch % 5 == 0:
             results = evaluate(
                 model, train_data, kinase_labels, mask_dict, edge_dict,
                 kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
-                fixed_pairs=fixed_eval_pairs
+                fixed_pairs=fixed_eval_pairs,
+                group_labels=group_labels
             )
             val_auc = results['val_auc']
             val_pr_auc = results['val_pr_auc']
             logging.info(
                 f"Epoch {epoch:03d} | Loss: {loss:.4f} | "
-                f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f} | "
+                f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f}, Val G-Acc: {results.get('val_group_acc', 0.0):.4f} | "
                 f"Train AUC: {results['train_auc']:.4f}, Val AUC: {val_auc:.4f}, Val PR-AUC: {results['val_pr_auc']:.4f} | "
                 f"Val F1: {results['val_f1']:.4f}, Val Prec: {results['val_precision']:.4f}, Val Rec: {results['val_recall']:.4f}"
             )
@@ -767,7 +850,8 @@ def main():
     final_results = evaluate(
         model, train_data, kinase_labels, mask_dict, edge_dict,
         kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
-        fixed_pairs=fixed_eval_pairs, threshold=best_thr
+        fixed_pairs=fixed_eval_pairs, threshold=best_thr,
+        group_labels=group_labels
     )
     logging.info(
         f"最终测试集性能: "

@@ -11,7 +11,7 @@
 与固定评估样本（seed=RANDOM_SEED+1000+i, num_neg=5, tail 策略），
 逐个加载 checkpoint 计算 Val/Test 的 AUC 与 PR-AUC，输出对照表。
 
-注意：仅兼容 A1 之后的模型结构（含 family_prototypes / prior_weight）。
+注意：仅兼容 P2 之后的模型结构（similar_to 边 + 家族大组层级）。
 """
 
 import sys
@@ -29,8 +29,9 @@ for p in (str(PROJECT_ROOT), str(Path(__file__).resolve().parent)):
 
 from train_hgt_trans import (
     DEVICE, GRAPH_PATH, KINASE_FAMILY_FILE, RANDOM_SEED, NEG_STRATEGY,
+    ESM_KNN_K, NUM_KINASE_GROUPS,
     load_kinase_family_labels, build_true_edge_maps, build_fixed_eval_pairs,
-    select_best_f1_threshold,
+    select_best_f1_threshold, add_esm_knn_edges, build_family_groups,
 )
 from model.hgt_transformer import HGTTransformer
 
@@ -41,7 +42,10 @@ def build_protocol():
     kinase_names = data['kinase'].node_names
     num_kinase = len(kinase_names)
     num_site = data['site'].x.size(0)
-    _, num_families = load_kinase_family_labels(kinase_names, KINASE_FAMILY_FILE)
+    kinase_labels, num_families = load_kinase_family_labels(kinase_names, KINASE_FAMILY_FILE)
+    # P2: 与训练脚本一致地加 ESM-kNN 相似边与家族大组（必须在 clone 前作用于 data）
+    add_esm_knn_edges(data, ESM_KNN_K)
+    _, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
 
     full_edge_index = data['kinase', 'phosphorylates', 'site'].edge_index
     kinase_sites, site_kinases = build_true_edge_maps(full_edge_index)
@@ -86,7 +90,8 @@ def build_protocol():
           f"验证激酶 {len(val_k)}({val_edge_index.size(1)} 条边), "
           f"测试激酶 {len(test_k)}({test_edge_index.size(1)} 条边) | "
           f"负采样 {NEG_STRATEGY} x5 | PR-AUC 随机基线 ≈ {1/6:.3f}")
-    return train_data, fixed_pairs, (esm_dim, n2v_dim, site_dim, num_families, motif_len)
+    return (train_data, fixed_pairs, (esm_dim, n2v_dim, site_dim, num_families, motif_len,
+            int(family_group_map.size(1))), family_group_map)
 
 
 def eval_checkpoint(model, ckpt_path, train_data, fixed_pairs):
@@ -123,13 +128,14 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    train_data, fixed_pairs, dims = build_protocol()
-    esm_dim, n2v_dim, site_dim, num_families, motif_len = dims
+    train_data, fixed_pairs, dims, family_group_map = build_protocol()
+    esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
     model = HGTTransformer(
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
         num_families=num_families, hidden_dim=256, num_heads=4,
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
         motif_len=motif_len,
+        num_groups=num_groups, family_group_map=family_group_map,
     ).to(DEVICE)
 
     print(f"\n{'checkpoint':<40} {'Val AUC':>8} {'Val PR':>8} {'Val F1*':>8} "
