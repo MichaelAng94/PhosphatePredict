@@ -64,9 +64,9 @@ DEGREE_ALPHA = 0.5                # 激酶均衡采样: 正边采样权重 ∝ 1
 LAMBDA_NCE = 0.5                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
-LEARNING_RATE = 1e-4
-EPOCHS = 1000
-EARLY_STOPPING_PATIENCE = 20
+LEARNING_RATE = 8e-5
+EPOCHS = 2000
+EARLY_STOPPING_PATIENCE = 30
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -615,7 +615,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.2,
+        dropout=0.4,
         motif_len=motif_len
     ).to(DEVICE)
     
