@@ -65,7 +65,7 @@ DEGREE_ALPHA = 0.5                # 激酶均衡采样: 正边采样权重 ∝ 1
 LAMBDA_NCE = 0.5                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
-LEARNING_RATE = 8e-5
+LEARNING_RATE = 9e-5
 EPOCHS = 2000
 EARLY_STOPPING_PATIENCE = 30
 
@@ -652,11 +652,11 @@ def main():
         n2v_dim=n2v_dim,
         site_dim=site_dim,
         num_families=num_families,
-        hidden_dim=256,
+        hidden_dim=128,
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.4,
+        dropout=0.3,
         motif_len=motif_len
     ).to(DEVICE)
     
