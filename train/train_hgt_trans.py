@@ -58,6 +58,12 @@ LAMBDA_LINK = 1.0                 # 链接预测损失权重
 LAMBDA_RANK = 0.5                 # L3 排序损失权重（margin ranking，直接优化排序/AUC）
 RANKING_MARGIN = 1.0              # L3 排序损失间隔
 EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的训练激酶比例（其磷酸化边只退出消息传递，仍计入损失）
+# ---- P1 排序目标改造 ----
+HARD_NEG_PROBS = (0.4, 0.3, 0.3)  # 训练负样本策略混合比例: (随机tail, 同家族激酶head, 同蛋白位点tail)
+DEGREE_ALPHA = 0.5                # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
+LAMBDA_NCE = 0.5                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
+NCE_TEMP = 0.2                    # L4 温度
+NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
 LEARNING_RATE = 1e-4
 EPOCHS = 1000
 EARLY_STOPPING_PATIENCE = 20
@@ -156,6 +162,56 @@ def _generate_negatives(pos_k, pos_s, num_kinase, num_site,
         raise ValueError(f"未知负采样策略: {strategy}")
     return neg_k, neg_s
 
+def _generate_mixed_negatives(pos_k, pos_s, num_kinase, num_site,
+                              kinase_sites, site_kinases,
+                              kinase_family, family_kinases,
+                              site_protein, protein_sites, probs):
+    """P1 难负样本混合：每条负样本独立按 probs 抽策略——
+    - 随机 tail：保留激酶换随机位点（旧策略，维持基础难度）
+    - 同家族 head：保留位点换同家族激酶，逼模型学"家族内哪个成员"而非只学家族偏好
+    - 同蛋白 tail：保留激酶换同蛋白其它注释位点，蛋白上下文相同，只靠 motif 区分
+    候选不可行（家族唯一成员 / 蛋白仅一个位点 / 候选全是真边）时回退随机破坏。
+    """
+    n = len(pos_k)
+    neg_k = pos_k.copy()
+    neg_s = pos_s.copy()
+    u = np.random.random(n)
+    m_rand = u < probs[0]
+    m_fam = (~m_rand) & (u < probs[0] + probs[1])
+    m_prot = ~(m_rand | m_fam)
+
+    if m_rand.any():
+        neg_s[m_rand] = _corrupt_and_filter(pos_k[m_rand], num_site, kinase_sites)
+
+    # 同家族激酶替换（head 破坏）
+    for i in np.where(m_fam)[0]:
+        cands = family_kinases.get(int(kinase_family[pos_k[i]]))
+        ok = False
+        if cands:
+            for _ in range(10):
+                c = cands[np.random.randint(len(cands))]
+                if c != pos_k[i] and c not in site_kinases[int(pos_s[i])]:
+                    neg_k[i] = c
+                    ok = True
+                    break
+        if not ok:   # 家族唯一成员或候选均为真边 → 回退随机 head
+            neg_k[i] = _corrupt_and_filter(np.array([pos_s[i]]), num_kinase, site_kinases)[0]
+
+    # 同蛋白位点替换（tail 破坏）
+    for i in np.where(m_prot)[0]:
+        cands = protein_sites.get(site_protein[int(pos_s[i])])
+        ok = False
+        if cands and len(cands) > 1:
+            for _ in range(10):
+                c = cands[np.random.randint(len(cands))]
+                if c != pos_s[i] and c not in kinase_sites[int(pos_k[i])]:
+                    neg_s[i] = c
+                    ok = True
+                    break
+        if not ok:   # 蛋白仅一个注释位点或候选均为真边 → 回退随机 tail
+            neg_s[i] = _corrupt_and_filter(np.array([pos_k[i]]), num_site, kinase_sites)[0]
+    return neg_k, neg_s
+
 def sample_link_prediction_pairs(edge_index_ks, num_kinase, num_site, num_neg=1,
                                  batch_size=10000, kinase_sites=None, site_kinases=None,
                                  strategy="tail"):
@@ -182,6 +238,39 @@ def sample_link_prediction_pairs(edge_index_ks, num_kinase, num_site, num_neg=1,
     for _ in range(num_neg):
         nk, ns = _generate_negatives(pos_k_np, pos_s_np, num_kinase, num_site,
                                      kinase_sites, site_kinases, strategy)
+        neg_k_list.append(nk)
+        neg_s_list.append(ns)
+
+    pos_k = torch.tensor(pos_k_np, dtype=torch.long, device=device)
+    pos_s = torch.tensor(pos_s_np, dtype=torch.long, device=device)
+    neg_k = torch.tensor(np.concatenate(neg_k_list), dtype=torch.long, device=device)
+    neg_s = torch.tensor(np.concatenate(neg_s_list), dtype=torch.long, device=device)
+    return pos_k, pos_s, neg_k, neg_s
+
+def sample_train_pairs(train_edge_index, batch_size, num_neg, num_kinase, num_site,
+                       kinase_sites, site_kinases, hard_ctx, edge_weights=None):
+    """P1 训练对采样：正边按激酶度反加权（稀有激酶过采样，DEGREE_ALPHA 控制强度），
+    负样本为难负混合（HARD_NEG_PROBS）。负样本布局与 sample_link_prediction_pairs
+    一致（round-major：第 r 轮的第 i 条负样本位于 r*n_pos+i）。"""
+    device = train_edge_index.device
+    pos_k_all = train_edge_index[0].cpu().numpy()
+    pos_s_all = train_edge_index[1].cpu().numpy()
+    total = len(pos_k_all)
+    if edge_weights is None:
+        indices = np.random.choice(total, batch_size, replace=total < batch_size)
+    else:
+        indices = np.random.choice(total, batch_size, replace=True, p=edge_weights)
+    pos_k_np = pos_k_all[indices]
+    pos_s_np = pos_s_all[indices]
+
+    neg_k_list, neg_s_list = [], []
+    for _ in range(num_neg):
+        nk, ns = _generate_mixed_negatives(
+            pos_k_np, pos_s_np, num_kinase, num_site,
+            kinase_sites, site_kinases,
+            hard_ctx['kinase_family'], hard_ctx['family_kinases'],
+            hard_ctx['site_protein'], hard_ctx['protein_sites'], HARD_NEG_PROBS,
+        )
         neg_k_list.append(nk)
         neg_s_list.append(ns)
 
@@ -222,7 +311,8 @@ def build_fixed_eval_pairs(edge_index, num_neg, num_kinase, num_site,
 
 # ==================== 训练和评估函数（支持掩码）====================
 def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
-                optimizer, criterion_class, criterion_link, kinase_sites, site_kinases):
+                optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
+                hard_ctx=None, edge_weights=None):
     model.train()
     optimizer.zero_grad()
 
@@ -259,10 +349,10 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     # 2. 链接预测损失（训练边 + 单侧破坏负样本，负样本经全量正边过滤）
     num_kinase = kinase_emb.size(0)
     num_site = site_emb.size(0)
-    pos_k, pos_s, neg_k, neg_s = sample_link_prediction_pairs(
-        train_edge_index, num_kinase, num_site,
-        num_neg=NUM_NEG_SAMPLES, batch_size=LINK_PRED_BATCH_SIZE,
-        kinase_sites=kinase_sites, site_kinases=site_kinases, strategy=NEG_STRATEGY
+    # P1: 训练对改为 度反加权正采样 + 难负混合（评估协议不变，仍用随机 tail 固定样本）
+    pos_k, pos_s, neg_k, neg_s = sample_train_pairs(
+        train_edge_index, LINK_PRED_BATCH_SIZE, NUM_NEG_SAMPLES, num_kinase, num_site,
+        kinase_sites, site_kinases, hard_ctx=hard_ctx, edge_weights=edge_weights,
     )
     pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s, fam_probs=fam_probs)
     neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s, fam_probs=fam_probs)
@@ -270,16 +360,42 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     label = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)]).float()
     loss_link = criterion_link(pred, label)
 
-    # 3. L3 排序损失：同一激酶的正样本 logit 应比其负样本 logit 高出至少 margin。
-    # 负样本按 [每个正样本 num_neg 条、与正样本同序] 排列，可按索引直接配对
+    # 3. L3 排序损失：正样本 logit 应比其同激酶配对的负样本 logit 高出至少 margin。
+    # 负样本为 round-major 布局：第 r 轮的第 i 条负样本位于 r*n_pos+i
     n_pos = pos_logits.size(0)
     neg_sel_idx = (
-        torch.arange(n_pos, device=pos_logits.device) * NUM_NEG_SAMPLES
-        + torch.randint(0, NUM_NEG_SAMPLES, (n_pos,), device=pos_logits.device)
+        torch.randint(0, NUM_NEG_SAMPLES, (n_pos,), device=pos_logits.device) * n_pos
+        + torch.arange(n_pos, device=pos_logits.device)
     )
     loss_rank = F.relu(RANKING_MARGIN - pos_logits + neg_logits[neg_sel_idx]).mean()
 
-    loss = LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link + LAMBDA_RANK * loss_rank
+    # 4. L4 批内对比损失（InfoNCE）：子批内所有 (k_i, s_j) 交叉打分，对角线为正，
+    # 非对角的已知真边从分母剔除；双向 CE 直接优化"真底物排在其它位点前"——与 PR-AUC 语义对齐
+    loss_nce = torch.tensor(0.0, device=pos_logits.device)
+    if LAMBDA_NCE > 0 and n_pos >= 2 and hard_ctx is not None:
+        m = min(NCE_BATCH, n_pos)
+        sel = torch.randperm(n_pos, device=pos_logits.device)[:m]
+        bk, bs = pos_k[sel], pos_s[sel]
+        ki = bk.repeat_interleave(m)
+        sj = bs.repeat(m)
+        pair_logits = model.interaction_logits(
+            kinase_emb, site_emb, ki, sj, fam_probs=fam_probs
+        ).view(m, m)
+        # 剔除非对角的已知真边（不作为负样本参与分母）
+        with torch.no_grad():
+            keys = (ki * num_site + sj).cpu().numpy()
+            is_true = np.isin(keys, hard_ctx['true_edge_keys'])
+            eye = np.eye(m, dtype=bool)
+            block = torch.tensor(is_true.reshape(m, m) & ~eye, device=pair_logits.device)
+        pair_logits = pair_logits.masked_fill(block, float('-inf'))
+        tgt = torch.arange(m, device=pair_logits.device)
+        loss_nce = 0.5 * (
+            F.cross_entropy(pair_logits / NCE_TEMP, tgt)
+            + F.cross_entropy(pair_logits.t() / NCE_TEMP, tgt)
+        )
+
+    loss = (LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link
+            + LAMBDA_RANK * loss_rank + LAMBDA_NCE * loss_nce)
     loss.backward()
     optimizer.step()
     return loss.item()
@@ -516,6 +632,38 @@ def main():
     mask_dict = {'train': train_kinase_mask, 'val': val_kinase_mask, 'test': test_kinase_mask}
     edge_dict = {'train': train_edge_index, 'val': val_edge_index, 'test': test_edge_index}
 
+    # P1: 难负样本与均衡采样所需的上下文（一次构建，训练循环复用）
+    kinase_family_np = kinase_labels.cpu().numpy()
+    family_kinases = defaultdict(list)
+    for idx, lab in enumerate(kinase_family_np):
+        if lab != -1:
+            family_kinases[int(lab)].append(idx)
+    site_protein = {}
+    protein_sites = defaultdict(list)
+    for idx, name in enumerate(data['site'].node_names):
+        prot = str(name).rsplit('_', 1)[0]   # 位点名形如 'EP0021246_S298'，前缀为蛋白 EPSD ID
+        site_protein[idx] = prot
+        protein_sites[prot].append(idx)
+    # 全量真边键（k*num_site+s，排序数组，供 L4 批内负样本 O(log n) 过滤）
+    _fk = full_edge_index.cpu().numpy()
+    true_edge_keys = np.unique(_fk[0].astype(np.int64) * num_site + _fk[1])
+    # 正边采样权重 ∝ 1/deg_train(kinase)^DEGREE_ALPHA（稀有激酶过采样）
+    _ek = train_edge_index[0].cpu().numpy()
+    train_deg = np.bincount(_ek, minlength=num_kinase).astype(np.float64)
+    _w = 1.0 / np.maximum(train_deg[_ek], 1.0) ** DEGREE_ALPHA
+    train_edge_weights = _w / _w.sum()
+    hard_ctx = {
+        'kinase_family': kinase_family_np,
+        'family_kinases': dict(family_kinases),
+        'site_protein': site_protein,
+        'protein_sites': dict(protein_sites),
+        'true_edge_keys': true_edge_keys,
+    }
+    logging.info(
+        f"P1 难负上下文: 有家族标签激酶 {sum(len(v) for v in family_kinases.values())}, "
+        f"蛋白 {len(protein_sites)} 个（多位点蛋白 {sum(1 for v in protein_sites.values() if len(v) > 1)} 个）"
+    )
+
     # 固定评估负样本：val/test 各预生成一份（全部正边 + 固定负样本），每次评估复用，
     # 消除随机重采导致的指标抖动；独立 seed + 状态恢复，不影响训练期随机性
     fixed_eval_pairs = {}
@@ -530,7 +678,8 @@ def main():
     for epoch in range(1, EPOCHS+1):
         loss = train_epoch(
             model, train_data, kinase_labels, train_kinase_mask, train_edge_index,
-            optimizer, criterion_class, criterion_link, kinase_sites, site_kinases
+            optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
+            hard_ctx=hard_ctx, edge_weights=train_edge_weights
         )
         
         # 每 5 个 epoch 评估一次（嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）

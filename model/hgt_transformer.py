@@ -11,7 +11,8 @@ class SiteMotifEncoder(nn.Module):
 
     输入整数编码的氨基酸窗口 [num_site, motif_len]（0=填充/未知，1..20=标准氨基酸，
     见 data_prep/add_motif_features.py），经 token 嵌入 + 位置嵌入和一层 Transformer
-    后做掩码均值池化，输出 [num_site, hidden_dim]，并入位点节点表示。
+    后做中心残基条件化读出（中心残基表示 + attention 池化上下文），
+    输出 [num_site, hidden_dim]，并入位点节点表示。
     """
     def __init__(self, motif_len: int, hidden_dim: int, vocab_size: int = 21,
                  num_heads: int = 4, dropout: float = 0.2):
@@ -28,6 +29,10 @@ class SiteMotifEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
         self.norm = nn.LayerNorm(hidden_dim)
+        # P3 中心残基条件化读出：[中心残基表示 ‖ attention 池化上下文] 线性融合
+        self.center = motif_len // 2
+        self.attn_w = nn.Parameter(torch.randn(hidden_dim) * 0.02)
+        self.readout = nn.Linear(hidden_dim * 2, hidden_dim)
 
     def forward(self, window: torch.Tensor) -> torch.Tensor:
         pad_mask = window == 0                      # [N, L]，True 表示填充
@@ -38,8 +43,14 @@ class SiteMotifEncoder(nn.Module):
         h = self.token_embed(window) + self.pos_embed[:, :window.size(1)]
         h = self.encoder(h, src_key_padding_mask=pad_mask)
         h = self.norm(h)
-        keep = (~pad_mask).float().unsqueeze(-1)    # [N, L, 1]
-        return (h * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)
+        # P3: 中心残基（磷酸化残基本身）单独保留，上下文用 attention 池化聚合，
+        # 避免均值池化稀释决定特异性的中心 ±1~3 位信号
+        c = min(self.center, window.size(1) - 1)
+        h_center = h[:, c]                                   # [N, H]
+        scores = (h @ self.attn_w).masked_fill(pad_mask, float('-inf'))
+        attn = torch.softmax(scores, dim=1)                  # [N, L]（全填充行已放开首位置）
+        h_ctx = (h * attn.unsqueeze(-1)).sum(dim=1)          # [N, H]
+        return self.readout(torch.cat([h_center, h_ctx], dim=-1))
 
 
 class HGTTransformer(nn.Module):
