@@ -29,7 +29,7 @@ for p in (str(PROJECT_ROOT), str(Path(__file__).resolve().parent)):
 
 from train_hgt_trans import (
     DEVICE, GRAPH_PATH, KINASE_FAMILY_FILE, RANDOM_SEED, NEG_STRATEGY,
-    ESM_KNN_K, NUM_KINASE_GROUPS,
+    ESM_KNN_K, ESM_SIM_MIN, NUM_KINASE_GROUPS,
     load_kinase_family_labels, build_true_edge_maps, build_fixed_eval_pairs,
     select_best_f1_threshold, add_esm_knn_edges, build_family_groups,
 )
@@ -44,7 +44,7 @@ def build_protocol():
     num_site = data['site'].x.size(0)
     kinase_labels, num_families = load_kinase_family_labels(kinase_names, KINASE_FAMILY_FILE)
     # P2: 与训练脚本一致地加 ESM-kNN 相似边与家族大组（必须在 clone 前作用于 data）
-    add_esm_knn_edges(data, ESM_KNN_K)
+    add_esm_knn_edges(data, ESM_KNN_K, ESM_SIM_MIN)
     _, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
 
     full_edge_index = data['kinase', 'phosphorylates', 'site'].edge_index
@@ -130,9 +130,13 @@ def main():
 
     train_data, fixed_pairs, dims, family_group_map = build_protocol()
     esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
+    # hidden_dim 从 checkpoint 自动推断（训练侧可能改动，如 256→128）
+    state0 = torch.load(ckpt_paths[0], map_location=DEVICE, weights_only=False)
+    hidden_dim = int(state0['family_prototypes'].shape[1])
+    del state0
     model = HGTTransformer(
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
-        num_families=num_families, hidden_dim=256, num_heads=4,
+        num_families=num_families, hidden_dim=hidden_dim, num_heads=4,
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
         motif_len=motif_len,
         num_groups=num_groups, family_group_map=family_group_map,

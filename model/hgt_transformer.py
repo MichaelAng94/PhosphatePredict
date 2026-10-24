@@ -142,6 +142,10 @@ class HGTTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
+        # D: 双线性解码分支——k^T W s 因子分解式乘性交互，与 concat-MLP 的特征拼接互补，
+        # 对 top 排序（PR-AUC）更友好；gate 初始 0 → 训练起点与原解码器完全等价
+        self.bilinear_w = nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 0.02)
+        self.bilinear_gate = nn.Parameter(torch.tensor(0.0))
 
         # A1 家族原型先验分支：family_prototypes 第 f 行 = 家族 f 的 motif 偏好向量。
         # 参数全家族共享（C×H，无逐激酶自由度），结构上无法记忆单个激酶；
@@ -177,7 +181,10 @@ class HGTTransformer(nn.Module):
         k_emb = kinase_emb[k_idx]   # [B, H]
         s_emb = site_emb[s_idx]     # [B, H]
         feats = torch.cat([k_emb, s_emb, k_emb * s_emb, (k_emb - s_emb).abs()], dim=-1)
-        main_logits = self.interaction_mlp(feats).squeeze(-1)   # [B]
+        main_logits = self.interaction_mlp(feats).squeeze(-1)
+        # D: 双线性项（RESCAL 式因子分解，gate 软开关）
+        bi = (k_emb * (s_emb @ self.bilinear_w.t())).sum(dim=-1) / (k_emb.size(-1) ** 0.5)
+        main_logits = main_logits + self.bilinear_gate * bi   # [B]
 
         # A1 先验分支：家族概率软混合原型偏好，与位点嵌入做缩放点积（/√d 控制量级）
         if fam_probs is None:

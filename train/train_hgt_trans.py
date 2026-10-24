@@ -68,7 +68,8 @@ NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
 STEPS_PER_EPOCH = 6              # A: 每 epoch 采样+梯度更新次数（L1 边丢弃随每次采样刷新，等效步数 ×K）
 # ---- P2 结构改造 ----
-ESM_KNN_K = 5                    # B1: ESM-kNN 相似激酶边（每个激酶 top-K 序列相似邻居）
+ESM_KNN_K = 10                   # B1: ESM-kNN 候选池大小（每个激酶考虑 top-K 相似邻居）
+ESM_SIM_MIN = 0.75               # B1: 余弦相似度下限——候选低于此值不连边（自适应度数，防噪声边）
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 LEARNING_RATE = 9e-5
@@ -145,10 +146,10 @@ def load_kinase_family_labels(kinase_nodes, family_file):
     logging.info(f"激酶家族类别数: {num_classes}, 有标签的激酶数: {(labels != -1).sum().item()}")
     return labels, num_classes
 
-def add_esm_knn_edges(data, k=5):
-    """P2-B1: 用 ESM 余弦相似度为激酶加 similar_to 边（top-k 邻居，对称化去重）。
-    仅用序列特征、无任何标注泄漏——冷启动激酶经此从相似训练激酶继承底物特异性。
-    k<=0 时写入空边集以保持图结构与模型 metadata 一致。返回边数。"""
+def add_esm_knn_edges(data, k=10, sim_min=0.75):
+    """P2-B1（精细化）: 每个激酶取 ESM 余弦 top-k 候选，仅保留 sim>=sim_min 的连边
+    （自适应度数：近亲多的激酶多连、无近亲的激酶不连噪声边），对称化去重。
+    仅用序列特征、无任何标注泄漏。k<=0 时写入空边集保持图结构与 metadata 一致。返回边数。"""
     esm = data['kinase'].esm_x
     n = esm.size(0)
     if k <= 0 or n <= 1:
@@ -157,12 +158,26 @@ def add_esm_knn_edges(data, k=5):
     esm_n = torch.nn.functional.normalize(esm, dim=-1)
     sim = esm_n @ esm_n.t()
     sim.fill_diagonal_(-1.0)
-    topi = sim.topk(min(k, n - 1), dim=-1).indices
-    src = torch.arange(n, device=esm.device).repeat_interleave(topi.size(1))
-    dst = topi.reshape(-1)
+    k_eff = min(k, n - 1)
+    topv, topi = sim.topk(k_eff, dim=-1)          # 候选相似度 + 索引
+    keep = topv >= sim_min
+    keep_flat = keep.reshape(-1)
+    deg = keep.sum(dim=1)
+    iso = int((deg == 0).sum())
+    if int(keep_flat.sum()) == 0:
+        data['kinase', 'similar_to', 'kinase'].edge_index = torch.zeros(2, 0, dtype=torch.long, device=esm.device)
+        logging.warning(f"P2-B1: sim>={sim_min} 下无任何相似边——阈值过高，请下调 ESM_SIM_MIN")
+        return 0
+    src = torch.arange(n, device=esm.device).repeat_interleave(k_eff)[keep_flat]
+    dst = topi.reshape(-1)[keep_flat]
     ei = torch.cat([torch.stack([src, dst]), torch.stack([dst, src])], dim=1)
     ei = torch.unique(ei, dim=1)
     data['kinase', 'similar_to', 'kinase'].edge_index = ei
+    logging.info(f"P2-B1: 候选相似度 top{k_eff} 分布 median={topv.median():.3f} "
+                 f"min={topv.min():.3f} max={topv.max():.3f} | 阈值 {sim_min} 后边数 {ei.size(1)}，"
+                 f"中位度数 {deg.median().item():.0f}，无邻居激酶 {iso}/{n}")
+    if iso > 0.3 * n:
+        logging.warning("P2-B1: 超过 30% 激酶无相似边（无近亲可继承）——确认 ESM_SIM_MIN 是否过严")
     return ei.size(1)
 
 def build_family_groups(data, kinase_labels, num_families, num_groups, seed):
@@ -700,8 +715,7 @@ def main():
     
     # P2-B1: ESM-kNN 相似激酶边（仅用序列特征，无标注泄漏），必须在 clone 前加到 data：
     # 冷启动激酶经此从序列相似的训练激酶继承底物特异性
-    num_sim_edges = add_esm_knn_edges(data, ESM_KNN_K)
-    logging.info(f"P2-B1: ESM-kNN 相似激酶边 {num_sim_edges} 条（top-{ESM_KNN_K}，对称去重后）")
+    num_sim_edges = add_esm_knn_edges(data, ESM_KNN_K, ESM_SIM_MIN)
     # P2-B2: 家族→大组层级（KMeans 聚类家族 ESM 质心，适配任意家族命名体系）
     group_labels, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
     group_labels = group_labels.to(DEVICE)
