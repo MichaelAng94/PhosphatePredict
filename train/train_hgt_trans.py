@@ -70,6 +70,7 @@ STEPS_PER_EPOCH = 6              # A: 每 epoch 采样+梯度更新次数（L1 �
 # ---- P2 结构改造 ----
 ESM_KNN_K = 10                   # B1: ESM-kNN 候选池大小（每个激酶考虑 top-K 相似邻居）
 ESM_SIM_MIN = 0.75               # B1: 余弦相似度下限——候选低于此值不连边（自适应度数，防噪声边）
+ESM_FALLBACK_K = 1               # B1: 保底邻居数——低于阈值的激酶强制连 top-K 相似候选（保证冷启动激酶有近亲可继承）
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 LEARNING_RATE = 9e-5
@@ -160,7 +161,23 @@ def add_esm_knn_edges(data, k=10, sim_min=0.75):
     sim.fill_diagonal_(-1.0)
     k_eff = min(k, n - 1)
     topv, topi = sim.topk(k_eff, dim=-1)          # 候选相似度 + 索引
+    # B1 数据质量诊断：近零范数 ESM 向量（疑似缺失嵌入零填充）无法产生有意义的相似边
+    norms = esm.norm(dim=-1)
+    bad = int((norms < 1e-6).sum())
+    if bad:
+        logging.warning(f"P2-B1: {bad} 个激酶 ESM 向量范数近零（疑似缺失嵌入零填充），"
+                        f"其相似边与输入特征均不可靠，请检查上游 ESM 数据")
     keep = topv >= sim_min
+    # B1 保底邻居：无邻居激酶强制连 top-ESM_FALLBACK_K 个候选（topv 已按相似度降序），
+    # sim_min 只负责截断邻居过多的激酶——保证每个冷启动激酶都有近亲可继承底物特异性
+    deg = keep.sum(dim=1)
+    iso_mask = deg < ESM_FALLBACK_K
+    if iso_mask.any():
+        fb_cols = torch.arange(k_eff, device=esm.device).unsqueeze(0) < ESM_FALLBACK_K
+        keep = keep | (iso_mask.unsqueeze(1) & fb_cols)
+        logging.info(f"P2-B1: {int(iso_mask.sum())} 个激酶低于阈值无相似边，"
+                     f"已强制连 top-{ESM_FALLBACK_K} 保底邻居（其 top1 相似度 median="
+                     f"{topv[iso_mask, 0].median():.3f}，过低则说明 ESM 嵌入本身可疑）")
     keep_flat = keep.reshape(-1)
     deg = keep.sum(dim=1)
     iso = int((deg == 0).sum())
@@ -511,7 +528,15 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     loss.backward()
     clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
-    return loss.item()
+    # 分项 loss（已乘权重，各项之和 = 总 loss）：打印各分项便于判断
+    # 哪个损失主导优化、哪个在震荡或被其它项抵消
+    return {
+        'family': LAMBDA_FAMILY * loss_family.detach().item(),
+        'link':   LAMBDA_LINK * loss_link.detach().item(),
+        'rank':   LAMBDA_RANK * loss_rank.detach().item(),
+        'nce':    LAMBDA_NCE * loss_nce.detach().item(),
+        'group':  LAMBDA_GROUP * loss_group.detach().item(),
+    }
 
 def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
              kinase_sites, site_kinases, num_neg_eval=5, neg_strategy="tail",
@@ -824,14 +849,18 @@ def main():
     # logging.info("start training...")
     for epoch in range(1, EPOCHS+1):
         # A: 每 epoch 采样+更新 K 次（L1 边丢弃随每次采样刷新），等效优化步数 ×K
-        loss = sum(
-            train_epoch(
+        comp = {}
+        for _ in range(STEPS_PER_EPOCH):
+            parts = train_epoch(
                 model, train_data, kinase_labels, train_kinase_mask, train_edge_index,
                 optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
                 hard_ctx=hard_ctx, edge_weights=train_edge_weights
             )
-            for _ in range(STEPS_PER_EPOCH)
-        ) / STEPS_PER_EPOCH
+            for k, v in parts.items():
+                comp[k] = comp.get(k, 0.0) + v / STEPS_PER_EPOCH
+        loss = sum(comp.values())
+        comp_str = (f"fam {comp['family']:.3f} | link {comp['link']:.3f} | "
+                    f"rank {comp['rank']:.3f} | nce {comp['nce']:.3f} | grp {comp['group']:.3f}")
         
         # 每 5 个 epoch 评估一次（嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）
         if epoch % 5 == 0:
@@ -844,7 +873,7 @@ def main():
             val_auc = results['val_auc']
             val_pr_auc = results['val_pr_auc']
             logging.info(
-                f"Epoch {epoch:03d} | Loss: {loss:.4f} | "
+                f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}] | "
                 f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f}, Val G-Acc: {results.get('val_group_acc', 0.0):.4f} | "
                 f"Train AUC: {results['train_auc']:.4f}, Val AUC: {val_auc:.4f}, Val PR-AUC: {results['val_pr_auc']:.4f} | "
                 f"Val F1@0.5: {results['val_f1']:.4f} | "
@@ -865,7 +894,7 @@ def main():
                     break
         else:
             if epoch % 1 == 0:
-                logging.info(f"Epoch {epoch:03d} | Loss: {loss:.4f}")
+                logging.info(f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}]")
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
