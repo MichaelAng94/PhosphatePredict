@@ -551,7 +551,8 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
         num_site = site_emb.size(0)
         for split, eidx in edge_index_dict.items():
             if eidx.size(1) == 0:
-                for key in ('auc', 'pr_auc', 'f1', 'acc_link', 'precision', 'recall'):
+                for key in ('auc', 'pr_auc', 'f1', 'acc_link', 'precision', 'recall',
+                            'f1_cal', 'thr_cal', 'precision_cal', 'recall_cal'):
                     results[f'{split}_{key}'] = 0.0
                 continue
             if fixed_pairs is not None and split in fixed_pairs:
@@ -577,6 +578,17 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
             results[f'{split}_acc_link'] = accuracy_score(label, pred_labels)
             results[f'{split}_precision'] = precision_score(label, pred_labels, zero_division=0)
             results[f'{split}_recall'] = recall_score(label, pred_labels, zero_division=0)
+
+            # 阈值无关监控口径：NCE/难负样本压缩了 logit 量纲，0.5 不再对应判别边界，
+            # 固定阈值下的 F1/Recall 会失真（Prec 高、Rec 塌到 ~0）——排序能力应看 PR-AUC
+            # 和本 split 自身最优阈值下的 F1（*_cal，仅用于训练期监控，数值偏乐观）；
+            # 测试集最终报告仍用 val 校准的统一阈值，不接触测试数据
+            thr_cal, f1_cal = select_best_f1_threshold(label, pred)
+            pred_labels_cal = (pred >= thr_cal).astype(int)
+            results[f'{split}_thr_cal'] = thr_cal
+            results[f'{split}_f1_cal'] = f1_cal
+            results[f'{split}_precision_cal'] = precision_score(label, pred_labels_cal, zero_division=0)
+            results[f'{split}_recall_cal'] = recall_score(label, pred_labels_cal, zero_division=0)
     return results
 
 def get_link_pred_predictions(model, embed_data, edge_index, kinase_sites, site_kinases,
@@ -835,7 +847,9 @@ def main():
                 f"Epoch {epoch:03d} | Loss: {loss:.4f} | "
                 f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f}, Val G-Acc: {results.get('val_group_acc', 0.0):.4f} | "
                 f"Train AUC: {results['train_auc']:.4f}, Val AUC: {val_auc:.4f}, Val PR-AUC: {results['val_pr_auc']:.4f} | "
-                f"Val F1: {results['val_f1']:.4f}, Val Prec: {results['val_precision']:.4f}, Val Rec: {results['val_recall']:.4f}"
+                f"Val F1@0.5: {results['val_f1']:.4f} | "
+                f"Val F1*(thr={results['val_thr_cal']:.3f}): {results['val_f1_cal']:.4f}, "
+                f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f}"
             )
             
             # 早停（基于验证集 AUC）
@@ -843,7 +857,7 @@ def main():
                 best_val_auc = val_pr_auc
                 patience_counter = 0
                 save_checkpoint(model)
-                logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1 = {results['val_f1']:.4f})")
+                logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})")
             else:
                 patience_counter += 1
                 if patience_counter >= EARLY_STOPPING_PATIENCE:
@@ -877,6 +891,10 @@ def main():
         f"Link Acc = {final_results['test_acc_link']:.4f}, "
         f"Precision = {final_results['test_precision']:.4f}, "
         f"Recall = {final_results['test_recall']:.4f}"
+    )
+    logging.info(
+        f"参考上界: test 自身最优阈值 F1 = {final_results['test_f1_cal']:.4f} @ {final_results['test_thr_cal']:.4f}"
+        f"（阈值已接触测试数据，仅用于诊断阈值漂移，不作为正式指标）"
     )
 
     # 获取训练、验证、测试集的预测结果（嵌入统一由 train_data 计算）
