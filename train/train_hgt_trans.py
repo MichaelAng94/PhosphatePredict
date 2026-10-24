@@ -63,7 +63,7 @@ EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的�
 # ---- P1 排序目标改造 ----
 HARD_NEG_PROBS = (0.4, 0.3, 0.3)  # 训练负样本策略混合比例: (随机tail, 同家族激酶head, 同蛋白位点tail)
 DEGREE_ALPHA = 0.5                # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
-LAMBDA_NCE = 0.5                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
+LAMBDA_NCE = 0.4                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
 STEPS_PER_EPOCH = 6              # A: 每 epoch 采样+梯度更新次数（L1 边丢弃随每次采样刷新，等效步数 ×K）
@@ -783,7 +783,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.3,
+        dropout=0.2,
         motif_len=motif_len,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
