@@ -74,7 +74,7 @@ NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMean
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 LEARNING_RATE = 9e-5
 EPOCHS = 2000
-EARLY_STOPPING_PATIENCE = 30
+EARLY_STOPPING_PATIENCE = 20
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
