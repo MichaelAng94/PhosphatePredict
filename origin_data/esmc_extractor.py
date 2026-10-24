@@ -1,0 +1,233 @@
+import os, sys
+import torch
+import numpy as np
+from esm.models.esmc import ESMC
+from esm.sdk.api import ESMProtein, LogitsConfig
+from esm.tokenization.sequence_tokenizer import EsmSequenceTokenizer
+from tqdm import tqdm
+
+training_config = {
+    'repr_layers': [34, 35, 36]   # ESMC-600M 有36层，这里提取最后三层
+}
+
+# def load_pretrained_esmc_600m(pth_path: str = settings["esm3b_path"], device: torch.device | None = None):
+#     if device is None:
+#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     elif isinstance(device,str):
+#         device = torch.device(device)
+#     model = ESMC_600M_202412(device=device, pth_path=pth_path)
+#     if device.type != "cpu":
+#         model = model.to(torch.bfloat16)
+#     assert isinstance(model, ESMC)
+#     return model
+
+def get_esmc_model_tokenizers() -> EsmSequenceTokenizer:
+    return EsmSequenceTokenizer()
+
+# def ESMC_600M_202412(device: torch.device | str = "cpu", pth_path: str = settings["esm3b_path"], use_flash_attn: bool = True):
+#     with torch.device(device):
+#         model = ESMC(
+#             d_model=1152,
+#             n_heads=18,
+#             n_layers=36,
+#             tokenizer=get_esmc_model_tokenizers(),
+#             use_flash_attn=use_flash_attn,
+#         ).eval()
+#     state_dict = torch.load(
+#         pth_path,
+#         map_location=device,
+#     )
+#     model.load_state_dict(state_dict)
+
+#     return model
+
+
+def fasta2esm(
+        fasta_file,
+        output_dir,
+        repr_layers:list=training_config['repr_layers'], # esmc-600m-2024-12 has 36 layers
+    ):
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
+    name_list=[]
+    sequence_list=[]
+    fp=open(fasta_file)
+    for block in ('\n'+fp.read().strip()).split('\n>'):
+        if not block.strip():
+            continue
+        lines=block.splitlines()
+        name_list.append(lines[0].split()[0])
+        sequence_list.append(''.join(lines[1:]))
+    fp.close()
+    
+    Nseq=len(sequence_list)
+    print('Embedding %d sequence from %s to %s'%(Nseq,fasta_file,output_dir))
+    
+    device='cpu'
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+        device='cuda'
+    
+    print("Using "+device)
+
+    client = ESMC.from_pretrained("esmc_600m").to(device)
+    # client = load_pretrained_esmc_600m(device=device)
+    EMBEDDING_CONFIG = LogitsConfig(
+        #sequence=True, 
+        #return_embeddings=True, 
+        return_hidden_states=True
+    )
+    for n in tqdm(range(Nseq)):
+        name=name_list[n]
+        safe_name = name.replace('/', '_').replace('\\', '_').replace(':', '_')
+        out_file = os.path.join(output_dir, safe_name + ".npy")
+        if os.path.isfile(out_file):
+            continue
+        #print(out_file)
+        result={'name':name,'mean':dict()} # 1152
+        sequence=sequence_list[n][:2048]
+        protein = ESMProtein(sequence=sequence)
+        protein_tensor = client.encode(protein)
+        logits_output = client.logits(protein_tensor, EMBEDDING_CONFIG)
+        hidden_states = logits_output.hidden_states.mean(axis=2)
+        for layer in repr_layers:
+            result['mean'][layer]=hidden_states[layer-1][0].cpu(
+                ).to(dtype=torch.float32).numpy()
+        np.save(out_file, result, allow_pickle=True)
+    return
+
+def extract_embeddings(fasta_file):
+    fasta2esm( fasta_file, settings['embedding_dir'])
+    return
+
+def run_mmseqs(fasta_file:str, fasta_dict:dict, db:str, output_dir:str):
+    # taln, tseq
+    outfile=os.path.join(output_dir,os.path.basename(fasta_file)+".m6")
+    if not os.path.isfile(outfile):
+    #if True:
+        cmd=settings['mmseqs']+' easy-search --max-seqs 10 -s 5.7 --split-memory-limit 30G '+fasta_file+' '+db+' '+outfile+' '+settings['tmp_dir']+' --format-output query,target,qlen,tlen,alnlen,fident,bits,tseq,tstart --threads 1 -e 1e-2'
+        #cmd=settings['mmseqs']+' easy-search -s 5.7 --split-memory-limit 30G '+fasta_file+' '+db+' '+outfile+' '+settings['tmp_dir']+' --format-output query,target,qlen,tlen,alnlen,fident,bits,tseq,tstart --threads 1 -e 1e-2'
+        print(cmd)
+        os.system(cmd)
+
+    homolog_dict=dict()
+    fp=open(outfile)
+    for line in fp.read().splitlines():
+        query,target,qlen,tlen,alnlen,fident,bits,tseq,tstart=line.split('\t')
+        #if tseq==fasta_dict[query]:
+            #continue # remove identical
+        ID=float(fident)*int(alnlen)/max((int(qlen),int(tlen)))
+        if not query in homolog_dict:
+            homolog_dict[query]=[]
+        elif len(homolog_dict[query])>=4:
+        #elif len(homolog_dict[query])>=100:
+            continue
+        L=len(tseq)
+        if L>2048:
+            tstart=int(tstart)
+            print("db sequence %s (L=%d) too long"%(target,L))
+            if tstart+2048<=L:
+                tseq=tseq[(tstart-1):(tstart+2047)]
+            else:
+                tseq=tseq[-2048:]
+                
+        homolog_dict[query].append((
+            ID,
+            float(bits),
+            tseq.replace('-','')[:2048]
+            ))
+    fp.close()
+    return homolog_dict
+
+def homolog2esm(
+        fasta_file:str,
+        output_dir:str,
+        db:str,
+        repr_layers:list=training_config['repr_layers'], # esmc-600m-2024-12 has 36 layers
+    ):
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
+    print('running mmseqs')
+    
+    name_list=[]
+    sequence_list=[]
+    fasta_dict=dict()
+    fp=open(fasta_file)
+    for block in ('\n'+fp.read().strip()).split('\n>'):
+        if not block.strip():
+            continue
+        lines=block.splitlines()
+        name_list.append(lines[0].split()[0])
+        sequence_list.append(''.join(lines[1:]))
+        fasta_dict[name_list[-1]]=sequence_list[-1]
+    fp.close()
+    
+    homolog_dict=run_mmseqs(fasta_file, fasta_dict, db, output_dir)
+    
+    Nseq=len(sequence_list)
+    print('Embedding %d sequence from %s to %s'%(Nseq,fasta_file,output_dir))
+    
+    device='cpu'
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = '0'
+        device='cuda'
+    
+    print("Using "+device)
+
+    client = ESMC.from_pretrained("esmc_600m").to(device)
+    # client = load_pretrained_esmc_600m(device=device)
+    EMBEDDING_CONFIG = LogitsConfig(
+        #sequence=True, 
+        #return_embeddings=True, 
+        return_hidden_states=True
+    )
+    for n in tqdm(range(Nseq)):
+        name=name_list[n]
+        safe_name = name.replace('/', '_').replace('\\', '_').replace(':', '_')
+        out_file = os.path.join(output_dir, safe_name + ".npy")
+        if os.path.isfile(out_file):
+            continue
+        #print(out_file)
+        result={'name':name,'mean':dict(),'homo':dict()} # 1152
+        sequence=sequence_list[n][:2048]
+        protein = ESMProtein(sequence=sequence)
+        protein_tensor = client.encode(protein)
+        logits_output = client.logits(protein_tensor, EMBEDDING_CONFIG)
+        hidden_states = logits_output.hidden_states.mean(axis=2)
+        for layer in repr_layers:
+            result['mean'][layer]=hidden_states[layer-1][0].cpu(
+                ).to(dtype=torch.float32).numpy()
+        if not name in homolog_dict or len(homolog_dict[name])==0:
+        #if False:
+            for layer in repr_layers:
+                result['homo'][layer]=result['mean'][layer]
+        else:
+            for layer in repr_layers:
+                result['homo'][layer]=np.zeros(len(result['mean'][layer]))
+            weight_list=[]
+            if name in homolog_dict:
+                for ID,bits,sequence in homolog_dict[name]:
+                    weight=ID*bits
+                    weight_list.append(weight)
+                    protein = ESMProtein(sequence=sequence)
+                    protein_tensor = client.encode(protein)
+                    logits_output = client.logits(protein_tensor, EMBEDDING_CONFIG)
+                    hidden_states = logits_output.hidden_states.mean(axis=2)
+                    for layer in repr_layers:
+                        result['homo'][layer]+=(hidden_states[layer-1][0].cpu(
+                            ).to(dtype=torch.float32).numpy())*weight
+            if len(weight_list):
+                weight=sum(weight_list)
+                for layer in repr_layers:
+                    result['homo'][layer]/=weight
+        np.save(out_file, result, allow_pickle=True)
+    return
+
+def extract_homolog_embeddings(fasta_file, db):
+    homolog2esm( fasta_file, settings['embedding_dir'], db)
+    return
+
+if __name__=="__main__":
+    fasta_file='origin_data/all_windows.fasta'
+    output_dir='origin_data/substrate'
+    fasta2esm(fasta_file,output_dir)
