@@ -74,6 +74,11 @@ ESM_FALLBACK_K = 1               # B1: 保底邻居数——低于阈值的激�
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 LEARNING_RATE = 9e-5
+# LR 调度：连续 LR_PATIENCE 次评估（每次间隔 5 epoch）Val PR-AUC 不涨则降半档，
+# 下限 LR_MIN；与早停独立，不重置早停计数器
+LR_PATIENCE = 3
+LR_FACTOR = 0.5
+LR_MIN = 1e-6
 EPOCHS = 2000
 EARLY_STOPPING_PATIENCE = 20
 
@@ -793,6 +798,9 @@ def main():
     criterion_class = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_link = nn.BCEWithLogitsLoss()   # 配合 interaction_logits，数值上比 BCELoss(sigmoid) 更稳定
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=LR_FACTOR, patience=LR_PATIENCE, min_lr=LR_MIN
+    )
     
     # 7. 训练循环
     best_val_auc = 0.0
@@ -881,6 +889,13 @@ def main():
                 f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f}"
             )
             
+            # LR 调度：以 Val PR-AUC 为信号（与早停同指标、同评估节奏）
+            old_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(val_pr_auc)
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr != old_lr:
+                logging.info(f"  -> LR 降档: {old_lr:.2e} -> {new_lr:.2e}")
+
             # 早停（基于验证集 AUC）
             if val_pr_auc > best_val_auc:
                 best_val_auc = val_pr_auc
