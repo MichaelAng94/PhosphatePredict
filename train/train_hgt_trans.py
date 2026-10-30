@@ -80,7 +80,7 @@ LR_PATIENCE = 3
 LR_FACTOR = 0.5
 LR_MIN = 1e-6
 EPOCHS = 2000
-EARLY_STOPPING_PATIENCE = 20
+EARLY_STOPPING_PATIENCE = 30
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -784,11 +784,11 @@ def main():
         n2v_dim=n2v_dim,
         site_dim=site_dim,
         num_families=num_families,
-        hidden_dim=128,
+        hidden_dim=192,
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.2,
+        dropout=0.15,
         motif_len=motif_len,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
@@ -888,25 +888,18 @@ def main():
                 f"Val F1*(thr={results['val_thr_cal']:.3f}): {results['val_f1_cal']:.4f}, "
                 f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f}"
             )
-            
-            # LR 调度：以 Val PR-AUC 为信号（与早停同指标、同评估节奏）
-            old_lr = optimizer.param_groups[0]['lr']
-            scheduler.step(val_pr_auc)
-            new_lr = optimizer.param_groups[0]['lr']
-            if new_lr != old_lr:
-                logging.info(f"  -> LR 降档: {old_lr:.2e} -> {new_lr:.2e}")
 
-            # 早停（基于验证集 AUC）
-            if val_pr_auc > best_val_auc:
-                best_val_auc = val_pr_auc
-                patience_counter = 0
-                save_checkpoint(model)
-                logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})")
-            else:
-                patience_counter += 1
-                if patience_counter >= EARLY_STOPPING_PATIENCE:
-                    logging.info(f"Early stopping at epoch {epoch}")
-                    break
+            if epoch > 400:
+                if val_pr_auc > best_val_auc:
+                    best_val_auc = val_pr_auc
+                    patience_counter = 0
+                    save_checkpoint(model)
+                    logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= EARLY_STOPPING_PATIENCE:
+                        logging.info(f"Early stopping at epoch {epoch}")
+                        break
         else:
             if epoch % 1 == 0:
                 logging.info(f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}]")
