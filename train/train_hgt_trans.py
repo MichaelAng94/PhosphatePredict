@@ -73,6 +73,11 @@ ESM_SIM_MIN = 0.75               # B1: 余弦相似度下限——候选低于�
 ESM_FALLBACK_K = 1               # B1: 保底邻居数——低于阈值的激酶强制连 top-K 相似候选（保证冷启动激酶有近亲可继承）
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
+# ---- R1 检索式底物谱先验 ----
+RETRIEVAL_TOP_M = 20              # 每个激酶检索的 ESM 近邻训练激酶数（谱的支撑面）
+RETRIEVAL_TAU = 0.05              # 检索 softmax 温度（越小越接近硬 kNN，越大越接近家族均值）
+RETRIEVAL_SCALE = 10.0            # 谱值 log1p 前的线性缩放（控制先验动态范围）
+RETRIEVAL_NEG_MAX = 0.15          # 负样本反污染阈值：raw 谱值超此值的候选负样本重采（疑似未标注真底物）
 LEARNING_RATE = 9e-5
 # LR 调度：连续 LR_PATIENCE 次评估（每次间隔 5 epoch）Val PR-AUC 不涨则降半档，
 # 下限 LR_MIN；与早停独立，不重置早停计数器
@@ -288,6 +293,45 @@ def _generate_negatives(pos_k, pos_s, num_kinase, num_site,
         raise ValueError(f"未知负采样策略: {strategy}")
     return neg_k, neg_s
 
+def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
+                            top_m=20, tau=0.05, scale=10.0):
+    """R1: 检索式底物谱先验——对每个激酶 k，按 ESM 余弦相似度检索 top_m 个
+    **训练激酶**，softmax(sim/tau) 加权累加它们的训练底物指示向量，得到 k 的
+    近邻底物谱 profile[k, s]。谱经 log1p(profile*scale) 压缩量级后作为非参数
+    先验注入解码器（retrieval_gate 软开关控制信任度）。
+
+    与 kNN 相似边（P2-B1，传"表示"）互补：检索谱直接传"边本身"，无学习自由度、
+    无过拟合面，冷启动激酶可无损继承近亲的底物特异性。
+    只用训练激酶/训练边构建，零标注泄漏。
+    返回 (log1p 缩放谱 [K,S], 原始谱 [K,S])——原始谱另用于训练负样本反污染。
+    """
+    K = esm.size(0)
+    device = esm.device
+    train_kinase_mask = train_kinase_mask.to(device)   # 调用方可能在 CPU 上传掩码
+    m = min(top_m, int(train_kinase_mask.sum().item()))
+    if m <= 0:
+        return (torch.zeros(K, num_site, device=device),
+                torch.zeros(K, num_site, device=device))
+    esm_n = F.normalize(esm, dim=-1)
+    sim = esm_n @ esm_n.t()                       # [K, K]
+    sim[:, ~train_kinase_mask] = -1.0             # 只检索训练激酶（冷启动激酶不作检索源）
+    sim.fill_diagonal_(-1.0)                      # 不检索自己
+    topv, topi = sim.topk(m, dim=-1)              # [K, m]
+    w = torch.softmax(topv / tau, dim=-1)         # [K, m]
+
+    # 训练底物指示矩阵 A[k, s] = 1 表示训练边 (k→s)
+    A = torch.zeros(K, num_site, device=device)
+    tk = train_edge_index[0].to(device)
+    ts = train_edge_index[1].to(device)
+    A[tk, ts] = 1.0
+
+    # profile[k] = Σ_j w[k,j] · A[topi[k,j]]，分步累加避免 [K,m,S] 三维大张量
+    profile = torch.zeros(K, num_site, device=device)
+    for j in range(m):
+        profile += w[:, j].unsqueeze(1) * A[topi[:, j]]
+    del A
+    return torch.log1p(profile * scale), profile
+
 def _generate_mixed_negatives(pos_k, pos_s, num_kinase, num_site,
                               kinase_sites, site_kinases,
                               kinase_family, family_kinases,
@@ -480,6 +524,27 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         train_edge_index, LINK_PRED_BATCH_SIZE, NUM_NEG_SAMPLES, num_kinase, num_site,
         kinase_sites, site_kinases, hard_ctx=hard_ctx, edge_weights=edge_weights,
     )
+    # R1 负样本反污染：谱值高的 (k,s) 很可能是近亲激酶的真实底物（尚未标注），
+    # 当负样本训练会教模型压低 R1 先验本身。对谱值超阈值/撞真边的负样本
+    # 按其采样策略重采（tail 破坏→换位点，head 破坏→换激酶），最多 10 轮。
+    if hard_ctx is not None and 'retrieval_raw' in hard_ctx:
+        raw = hard_ctx['retrieval_raw']
+        n_pos_t = pos_k.size(0)
+        for _ in range(10):
+            keys = neg_k * num_site + neg_s
+            bad = ((raw[neg_k, neg_s] > RETRIEVAL_NEG_MAX)
+                   | torch.isin(keys, hard_ctx['true_edge_keys_t']))
+            if not bad.any():
+                break
+            idx = torch.where(bad)[0]
+            p_i = idx % n_pos_t                                  # round-major 对应正样本
+            is_tail = neg_k[idx] == pos_k[p_i]
+            if is_tail.any():
+                neg_s[idx[is_tail]] = torch.randint(
+                    0, num_site, (int(is_tail.sum()),), device=neg_k.device)
+            if (~is_tail).any():
+                neg_k[idx[~is_tail]] = torch.randint(
+                    0, num_kinase, (int((~is_tail).sum()),), device=neg_k.device)
     pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s, fam_probs=fam_probs)
     neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s, fam_probs=fam_probs)
     pred = torch.cat([pos_logits, neg_logits], dim=0)
@@ -763,6 +828,22 @@ def main():
     group_labels = group_labels.to(DEVICE)
     logging.info(f"P2-B2: {num_families} 个家族聚为 {int(family_group_map.size(1))} 个大组")
 
+    # R1: 检索式底物谱先验——每个激酶按 ESM 相似度检索 top-m 训练激酶，
+    # softmax 加权累加其训练底物谱（只用训练激酶/训练边，零标注泄漏）。
+    # 检索源 = 链接预测训练边涉及的激酶（train_edge_index 的行），而非分类掩码——
+    # 分类划分与边划分相互独立，谱的支撑面必须与训练边严格对齐
+    retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
+    retrieval_kmask[train_edge_index[0]] = True
+    retrieval_log, retrieval_raw = build_retrieval_profile(
+        data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
+        top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
+    )
+    covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
+    logging.info(
+        f"R1: 检索谱先验 top{RETRIEVAL_TOP_M}/tau={RETRIEVAL_TAU} 构建完成，"
+        f"有非零谱的激酶占比 {covered:.1%}（其余激酶无近邻训练底物可继承，退化为纯学习分支）"
+    )
+
     train_data = data.clone()
     train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
     train_data['site', 'rev_phosphorylates', 'kinase'].edge_index = train_edge_index[[1,0]]
@@ -793,6 +874,8 @@ def main():
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
     ).to(DEVICE)
+    # R1: 非参数谱矩阵注入（普通张量属性，不进 state_dict；eval_checkpoint 需同样注入才能复现协议）
+    model.retrieval_profile = retrieval_log.to(DEVICE)
     
     # 6. 损失函数与优化器
     criterion_class = nn.CrossEntropyLoss(ignore_index=-1)
@@ -836,6 +919,8 @@ def main():
         'site_protein': site_protein,
         'protein_sites': dict(protein_sites),
         'true_edge_keys': true_edge_keys,
+        'retrieval_raw': retrieval_raw,            # R1: 原始谱，负样本反污染用
+        'true_edge_keys_t': torch.as_tensor(true_edge_keys, dtype=torch.long, device=DEVICE),
         'group_labels': group_labels,
         'family_group_map': family_group_map.to(DEVICE),
     }

@@ -5,50 +5,98 @@ import torch.nn.functional as F
 from torch_geometric.nn import HGTConv, Linear
 from torch_geometric.data import HeteroData
 
+# R2: BLOSUM62 替换得分矩阵（标准排列 ARNDCQEGHILKMFPSTWYV，行=残基，列=替换目标）
+_BLOSUM_STD_ORDER = 'ARNDCQEGHILKMFPSTWYV'
+_BLOSUM62_ROWS = [
+    # A  R  N  D  C  Q  E  G  H  I  L  K  M  F  P  S  T  W  Y  V
+    [ 4, -1, -2, -2,  0, -1, -1,  0, -2, -1, -1, -1, -1, -2, -1,  1,  0, -3, -2,  0],  # A
+    [-1,  5,  0, -2, -3,  1,  0, -2,  0, -3, -2,  2, -1, -3, -2, -1, -1, -3, -2, -3],  # R
+    [-2,  0,  6,  1, -3,  0,  0,  0,  1, -3, -3,  0, -2, -3, -2,  1,  0, -3, -2, -3],  # N
+    [-2, -2,  1,  6, -3,  0,  2, -1, -1, -3, -4, -1, -3, -3, -1,  0, -1, -4, -3, -3],  # D
+    [ 0, -3, -3, -3,  9, -3, -4, -3, -3, -1, -1, -3, -1, -2, -3, -1, -1, -2, -2, -1],  # C
+    [-1,  1,  0,  0, -3,  5,  2, -2,  0, -3, -2,  1,  0, -3, -1,  0, -1, -2, -1, -2],  # Q
+    [-1,  0,  0,  2, -4,  2,  5, -2,  0, -3, -3,  1, -2, -3, -1,  0, -1, -3, -2, -2],  # E
+    [ 0, -2,  0, -1, -3, -2, -2,  6, -2, -4, -4, -2, -3, -3, -2,  0, -2, -3, -3, -3],  # G
+    [-2,  0,  1, -1, -3,  0,  0, -2,  8, -3, -3, -1, -2, -1, -2, -1, -2, -2,  2, -3],  # H
+    [-1, -3, -3, -3, -1, -3, -3, -4, -3,  4,  2, -3,  1,  0, -3, -2, -1, -3, -1,  3],  # I
+    [-1, -2, -3, -4, -1, -2, -3, -4, -3,  2,  4, -2,  2,  0, -3, -2, -1, -2, -1,  1],  # L
+    [-1,  2,  0, -1, -3,  1,  1, -2, -1, -3, -2,  5, -1, -3, -1,  0, -1, -3, -2, -2],  # K
+    [-1, -1, -2, -3, -1,  0, -2, -3, -2,  1,  2, -1,  5,  0, -2, -1, -1, -1, -1,  1],  # M
+    [-2, -3, -3, -3, -2, -3, -3, -3, -1,  0,  0, -3,  0,  6, -4, -2, -2,  1,  3, -1],  # F
+    [-1, -2, -2, -1, -3, -1, -1, -2, -2, -3, -3, -1, -2, -4,  7, -1, -1, -4, -3, -2],  # P
+    [ 1, -1,  1,  0, -1,  0,  0,  0, -1, -2, -2,  0, -1, -2, -1,  4,  1, -3, -2, -2],  # S
+    [ 0, -1,  0, -1, -1, -1, -1, -2, -2, -1, -1, -1, -1, -2, -1,  1,  5, -3, -2,  0],  # T
+    [-3, -3, -3, -4, -2, -2, -3, -3, -2, -3, -2, -3, -1,  1, -4, -3, -3, 11,  2, -3],  # W
+    [-2, -2, -2, -3, -2, -1, -2, -3,  2, -1, -1, -2, -1,  3, -3, -2, -2,  2,  7, -1],  # Y
+    [ 0, -3, -3, -3, -1, -2, -2, -3, -3,  3,  1, -2,  1, -1, -2, -2,  0, -3, -1,  4],  # V
+]
+
+
+def _blosum62_for_order(aa_order: str) -> torch.Tensor:
+    """返回按 aa_order 行列重排的 BLOSUM62 [20, 20] float 张量。"""
+    mat = torch.tensor(_BLOSUM62_ROWS, dtype=torch.float32)
+    perm = [_BLOSUM_STD_ORDER.index(a) for a in aa_order]
+    return mat[perm][:, perm]
+
 
 class SiteMotifEncoder(nn.Module):
-    """位点序列窗口(motif)编码器。
+    """R2: 位点序列窗口(motif)编码器——BLOSUM62 进化嵌入 + 多核 CNN。
 
     输入整数编码的氨基酸窗口 [num_site, motif_len]（0=填充/未知，1..20=标准氨基酸，
-    见 data_prep/add_motif_features.py），经 token 嵌入 + 位置嵌入和一层 Transformer
-    后做中心残基条件化读出（中心残基表示 + attention 池化上下文），
+    字母序 ACDEFGHIKLMNPQRSTVWY，见 data_prep/add_motif_features.py）。
+
+    每个残基的 token 向量 = 它对其余 20 种氨基酸的 BLOSUM62 替换得分（20 维，
+    进化先验替随机初始化，氨基酸相似度结构直接注入模型；嵌入冻结，自由度留给
+    可学习的投影层）。上下文用 3/5/7 三核并联 CNN（残差融合）建模局部基序——
+    激酶识别 motif 的决定性信号在中心 ±1~3 位，小窗口下 CNN 比全局自注意力
+    更契合且无 O(L²) 开销。最后做中心残基条件化读出，
     输出 [num_site, hidden_dim]，并入位点节点表示。
     """
     def __init__(self, motif_len: int, hidden_dim: int, vocab_size: int = 21,
                  num_heads: int = 4, dropout: float = 0.2):
         super().__init__()
-        self.token_embed = nn.Embedding(vocab_size, hidden_dim, padding_idx=0)
+        assert vocab_size >= 21, "需要 0=填充 + 20 种标准氨基酸"
+        self.token_embed = nn.Embedding(vocab_size, 20, padding_idx=0)
+        with torch.no_grad():
+            self.token_embed.weight[1:21] = _blosum62_for_order('ACDEFGHIKLMNPQRSTVWY')
+        self.token_embed.weight.requires_grad_(False)   # 冻结进化先验
+        self.embed_proj = nn.Linear(20, hidden_dim)
         self.pos_embed = nn.Parameter(torch.randn(1, motif_len, hidden_dim) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=1)
-        self.norm = nn.LayerNorm(hidden_dim)
+        # R2: 多核并联 CNN——3/5/7 分别对准中心 ±1、±2、±3 位局部基序
+        self.convs = nn.ModuleList([
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=k, padding=k // 2)
+            for k in (3, 5, 7)
+        ])
+        self.conv_fuse = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.conv_norm = nn.LayerNorm(hidden_dim)
         # P3 中心残基条件化读出：[中心残基表示 ‖ attention 池化上下文] 线性融合
         self.center = motif_len // 2
         self.attn_w = nn.Parameter(torch.randn(hidden_dim) * 0.02)
         self.readout = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, window: torch.Tensor) -> torch.Tensor:
         pad_mask = window == 0                      # [N, L]，True 表示填充
-        # 全填充行放开首个位置，避免该行注意力全部被掩码而产生 NaN
-        fully_padded = pad_mask.all(dim=1)
-        if fully_padded.any():
-            pad_mask[fully_padded, 0] = False
-        h = self.token_embed(window) + self.pos_embed[:, :window.size(1)]
-        h = self.encoder(h, src_key_padding_mask=pad_mask)
-        h = self.norm(h)
+        keep = (~pad_mask).unsqueeze(-1).to(torch.float32)  # [N, L, 1] 填充位置归零
+        # R2: BLOSUM62 替换得分嵌入（冻结）→ 投影 → +位置嵌入
+        h = self.embed_proj(self.token_embed(window)) + self.pos_embed[:, :window.size(1)]
+        # 多核 CNN：[N, L, H] → [N, H, L] → 三核并联 → concat [N, L, 3H] → 融合 + GELU 残差
+        x = h.transpose(1, 2)
+        h_cnn = torch.cat([conv(x) for conv in self.convs], dim=1)   # [N, 3H, L]
+        h_cnn = F.gelu(self.conv_fuse(h_cnn.transpose(1, 2)))       # [N, L, H]
+        h = self.conv_norm(h + self.dropout(h_cnn))
+        h = h * keep                                  # 填充位置不进入读出
         # P3: 中心残基（磷酸化残基本身）单独保留，上下文用 attention 池化聚合，
         # 避免均值池化稀释决定特异性的中心 ±1~3 位信号
         c = min(self.center, window.size(1) - 1)
         h_center = h[:, c]                                   # [N, H]
         scores = (h @ self.attn_w).masked_fill(pad_mask, float('-inf'))
-        attn = torch.softmax(scores, dim=1)                  # [N, L]（全填充行已放开首位置）
+        attn = torch.softmax(scores, dim=1)                  # [N, L]
+        # 全填充行 softmax(全 -inf) 为 NaN：直接置首位置权重 1（该行输出恒为 0 向量）
+        fully_padded = pad_mask.all(dim=1)
+        if fully_padded.any():
+            attn[fully_padded] = 0.0
+            attn[fully_padded, 0] = 1.0
         h_ctx = (h * attn.unsqueeze(-1)).sum(dim=1)          # [N, H]
         return self.readout(torch.cat([h_center, h_ctx], dim=-1))
 
@@ -147,6 +195,12 @@ class HGTTransformer(nn.Module):
         self.bilinear_w = nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 0.02)
         self.bilinear_gate = nn.Parameter(torch.tensor(0.0))
 
+        # R1 检索式底物谱先验：retrieval_profile 为非参数张量（训练脚本构造后注入
+        # [num_kinase, num_site] 的 log1p 缩放近邻底物谱，不进 state_dict，
+        # checkpoint 只保存 retrieval_gate 标量）；gate 初始 0 → 训练起点等价
+        self.retrieval_gate = nn.Parameter(torch.tensor(0.0))
+        self.retrieval_profile = None
+
         # A1 家族原型先验分支：family_prototypes 第 f 行 = 家族 f 的 motif 偏好向量。
         # 参数全家族共享（C×H，无逐激酶自由度），结构上无法记忆单个激酶；
         # prior_weight 为先验融合权重，初始 0 → 训练起点与原模型完全等价，信任程度由梯度自学
@@ -196,6 +250,10 @@ class HGTTransformer(nn.Module):
             # P2-B2 大组级先验：大组质心统计更稳，作为家族先验的粗粒度补充
             g_pref = (fam_probs @ self.family_group_map) @ self.group_prototypes    # [K, H]
             out = out + self.group_prior_weight * (g_pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)
+        # R1: 检索谱先验——ESM 近邻训练激酶的底物谱（log1p 缩放）按位加分，
+        # 非参数直通道（无学习自由度，无过拟合面），gate 软开关控制信任度
+        if self.retrieval_profile is not None:
+            out = out + self.retrieval_gate * self.retrieval_profile[k_idx, s_idx]
         return out
 
     def predict_interaction(self, kinase_emb: torch.Tensor, site_emb: torch.Tensor,

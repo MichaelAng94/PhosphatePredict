@@ -30,8 +30,10 @@ for p in (str(PROJECT_ROOT), str(Path(__file__).resolve().parent)):
 from train_hgt_trans import (
     DEVICE, GRAPH_PATH, KINASE_FAMILY_FILE, RANDOM_SEED, NEG_STRATEGY,
     ESM_KNN_K, ESM_SIM_MIN, NUM_KINASE_GROUPS,
+    RETRIEVAL_TOP_M, RETRIEVAL_TAU, RETRIEVAL_SCALE,
     load_kinase_family_labels, build_true_edge_maps, build_fixed_eval_pairs,
     select_best_f1_threshold, add_esm_knn_edges, build_family_groups,
+    build_retrieval_profile,
 )
 from model.hgt_transformer import HGTTransformer
 
@@ -66,6 +68,13 @@ def build_protocol():
     test_edge_index = full_edge_index[:, torch.as_tensor(
         np.isin(edge_kinases, test_k), device=full_edge_index.device)].to(DEVICE)
 
+    # R1: 与训练脚本一致地构建检索谱先验（只用训练激酶/训练边，零泄漏）
+    train_kinase_mask = torch.as_tensor(np.isin(kinase_names, train_k))
+    retrieval_log, _ = build_retrieval_profile(
+        data['kinase'].esm_x, train_kinase_mask.to(DEVICE), train_edge_index, num_site,
+        top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
+    )
+
     # 嵌入只由训练边快照计算（与训练期评估一致，避免评估边泄漏）
     train_data = data.clone()
     train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
@@ -91,7 +100,7 @@ def build_protocol():
           f"测试激酶 {len(test_k)}({test_edge_index.size(1)} 条边) | "
           f"负采样 {NEG_STRATEGY} x5 | PR-AUC 随机基线 ≈ {1/6:.3f}")
     return (train_data, fixed_pairs, (esm_dim, n2v_dim, site_dim, num_families, motif_len,
-            int(family_group_map.size(1))), family_group_map)
+            int(family_group_map.size(1))), family_group_map, retrieval_log)
 
 
 def eval_checkpoint(model, ckpt_path, train_data, fixed_pairs):
@@ -128,7 +137,7 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    train_data, fixed_pairs, dims, family_group_map = build_protocol()
+    train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
     esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
     # hidden_dim 从 checkpoint 自动推断（训练侧可能改动，如 256→128）
     state0 = torch.load(ckpt_paths[0], map_location=DEVICE, weights_only=False)
@@ -141,6 +150,8 @@ def main():
         motif_len=motif_len,
         num_groups=num_groups, family_group_map=family_group_map,
     ).to(DEVICE)
+    # R1: 注入检索谱先验——与训练时一致；漏掉则 R1 分支在评估中静默缺失，指标不可比
+    model.retrieval_profile = retrieval_log.to(DEVICE)
 
     print(f"\n{'checkpoint':<40} {'Val AUC':>8} {'Val PR':>8} {'Val F1*':>8} "
           f"{'Test AUC':>9} {'Test PR':>8} {'Test F1*':>8} {'thr':>7}")
