@@ -31,6 +31,7 @@ from train_hgt_trans import (
     DEVICE, GRAPH_PATH, KINASE_FAMILY_FILE, RANDOM_SEED, NEG_STRATEGY,
     ESM_KNN_K, ESM_SIM_MIN, NUM_KINASE_GROUPS,
     RETRIEVAL_TOP_M, RETRIEVAL_TAU, RETRIEVAL_SCALE,
+    RETRIEVAL_CONF_CENTER, RETRIEVAL_CONF_TEMP,
     load_kinase_family_labels, build_true_edge_maps, build_fixed_eval_pairs,
     select_best_f1_threshold, add_esm_knn_edges, build_family_groups,
     build_retrieval_profile,
@@ -68,11 +69,13 @@ def build_protocol():
     test_edge_index = full_edge_index[:, torch.as_tensor(
         np.isin(edge_kinases, test_k), device=full_edge_index.device)].to(DEVICE)
 
-    # R1: 与训练脚本一致地构建检索谱先验（只用训练激酶/训练边，零泄漏）
+    # R1: 与训练脚本一致地构建检索谱先验（只用训练激酶/训练边，零泄漏）；
+    # R1.1 置信度调制参数必须与训练一致，否则注入的谱与训练期不同，指标不可比
     train_kinase_mask = torch.as_tensor(np.isin(kinase_names, train_k))
-    retrieval_log, _ = build_retrieval_profile(
+    retrieval_log, _, _ = build_retrieval_profile(
         data['kinase'].esm_x, train_kinase_mask.to(DEVICE), train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
+        conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
     )
 
     # 嵌入只由训练边快照计算（与训练期评估一致，避免评估边泄漏）

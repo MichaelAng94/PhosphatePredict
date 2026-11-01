@@ -78,6 +78,10 @@ RETRIEVAL_TOP_M = 20              # 每个激酶检索的 ESM 近邻训练激酶
 RETRIEVAL_TAU = 0.05              # 检索 softmax 温度（越小越接近硬 kNN，越大越接近家族均值）
 RETRIEVAL_SCALE = 10.0            # 谱值 log1p 前的线性缩放（控制先验动态范围）
 RETRIEVAL_NEG_MAX = 0.15          # 负样本反污染阈值：raw 谱值超此值的候选负样本重采（疑似未标注真底物）
+# R1.1 置信度调制：与最近训练激酶的 ESM 相似度低于 CENTER 的激酶逐步关闭谱先验
+# （ESM 相似 ≠ 底物相似——孤立/非典型激酶的错误先验比无先验更糟，如 TAF1/RON）
+RETRIEVAL_CONF_CENTER = 0.85      # 置信度中心（top1 相似度等于此值时 conf=0.5）
+RETRIEVAL_CONF_TEMP = 0.04        # 置信度温度（越小开关越陡）
 LEARNING_RATE = 9e-5
 # LR 调度：连续 LR_PATIENCE 次评估（每次间隔 5 epoch）Val PR-AUC 不涨则降半档，
 # 下限 LR_MIN；与早停独立，不重置早停计数器
@@ -294,16 +298,24 @@ def _generate_negatives(pos_k, pos_s, num_kinase, num_site,
     return neg_k, neg_s
 
 def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
-                            top_m=20, tau=0.05, scale=10.0):
+                            top_m=20, tau=0.05, scale=10.0,
+                            conf_center=0.85, conf_temp=0.04):
     """R1: 检索式底物谱先验——对每个激酶 k，按 ESM 余弦相似度检索 top_m 个
     **训练激酶**，softmax(sim/tau) 加权累加它们的训练底物指示向量，得到 k 的
     近邻底物谱 profile[k, s]。谱经 log1p(profile*scale) 压缩量级后作为非参数
     先验注入解码器（retrieval_gate 软开关控制信任度）。
 
+    R1.1 置信度调制：谱再逐激酶乘 conf_k = sigmoid((top1_sim_k - conf_center)/conf_temp)
+    后注入——与最近训练激酶序列相似度高的激酶（近亲明确，如 P38D/AURC）完全信任谱；
+    相似度低于 conf_center 的孤立/非典型激酶（ESM 近亲的底物谱是错误先验，
+    如 TAF1/RON——R1 轮实测 AUC 被压到 0.18 出现反排序）自动衰减到近 0。
+    conf 烘焙进谱矩阵（模型/评估代码零改动）；conf_center=-inf 时 conf≡1 回退 R1。
+
     与 kNN 相似边（P2-B1，传"表示"）互补：检索谱直接传"边本身"，无学习自由度、
     无过拟合面，冷启动激酶可无损继承近亲的底物特异性。
     只用训练激酶/训练边构建，零标注泄漏。
-    返回 (log1p 缩放谱 [K,S], 原始谱 [K,S])——原始谱另用于训练负样本反污染。
+    返回 (conf 调制谱 [K,S], 原始谱 [K,S], 置信度 [K])——
+    原始谱（不含 conf）另用于训练负样本反污染。
     """
     K = esm.size(0)
     device = esm.device
@@ -311,7 +323,8 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     m = min(top_m, int(train_kinase_mask.sum().item()))
     if m <= 0:
         return (torch.zeros(K, num_site, device=device),
-                torch.zeros(K, num_site, device=device))
+                torch.zeros(K, num_site, device=device),
+                torch.zeros(K, device=device))
     esm_n = F.normalize(esm, dim=-1)
     sim = esm_n @ esm_n.t()                       # [K, K]
     sim[:, ~train_kinase_mask] = -1.0             # 只检索训练激酶（冷启动激酶不作检索源）
@@ -330,7 +343,9 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     for j in range(m):
         profile += w[:, j].unsqueeze(1) * A[topi[:, j]]
     del A
-    return torch.log1p(profile * scale), profile
+    # R1.1: 置信度由与最近训练激酶的相似度调制
+    conf = torch.sigmoid((topv[:, 0] - conf_center) / conf_temp)
+    return torch.log1p(profile * scale) * conf.unsqueeze(1), profile, conf
 
 def _generate_mixed_negatives(pos_k, pos_s, num_kinase, num_site,
                               kinase_sites, site_kinases,
@@ -834,15 +849,28 @@ def main():
     # 分类划分与边划分相互独立，谱的支撑面必须与训练边严格对齐
     retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
     retrieval_kmask[train_edge_index[0]] = True
-    retrieval_log, retrieval_raw = build_retrieval_profile(
+    retrieval_log, retrieval_raw, retrieval_conf = build_retrieval_profile(
         data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
+        conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
     )
     covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
+    low_conf = (retrieval_conf < 0.25).float().mean().item()
     logging.info(
         f"R1: 检索谱先验 top{RETRIEVAL_TOP_M}/tau={RETRIEVAL_TAU} 构建完成，"
         f"有非零谱的激酶占比 {covered:.1%}（其余激酶无近邻训练底物可继承，退化为纯学习分支）"
     )
+    logging.info(
+        f"R1.1: 置信度调制 center={RETRIEVAL_CONF_CENTER}/temp={RETRIEVAL_CONF_TEMP}，"
+        f"conf 中位数 {retrieval_conf.median():.3f}，低置信(<0.25)激酶 {low_conf:.1%}"
+        f"（谱先验自动关闭，防错误先验）"
+    )
+    # 诊断：A 类（预期低 conf）与 C 类（预期高 conf）抽查——验证调制方向
+    _kname_list = list(kinase_names)
+    _diag = [n for n in ('TAF1', 'RON', 'PKM', 'CHAK2', 'LKB1', 'VRK1', 'AURC', 'P38D', 'EGFR', 'TTK')
+             if n in _kname_list]
+    logging.info("R1.1 conf 诊断: " + ", ".join(
+        f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))
 
     train_data = data.clone()
     train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
