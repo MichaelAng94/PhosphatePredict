@@ -283,7 +283,7 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     splits = ('val', 'test') if args.split == 'both' else (args.split,)
 
-    train_data, fixed_pairs, dims, family_group_map = build_protocol()
+    train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
     esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
     state = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
     hidden_dim = int(state['family_prototypes'].shape[1])
@@ -293,6 +293,8 @@ def main():
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
         motif_len=motif_len, num_groups=num_groups, family_group_map=family_group_map,
     ).to(DEVICE)
+    # R1: 注入检索谱先验（与训练时一致；漏掉则 R1 分支在分析中静默缺失，指标不可比）
+    model.retrieval_profile = retrieval_log.to(DEVICE)
     model.load_state_dict(state)
     model.eval()
 
