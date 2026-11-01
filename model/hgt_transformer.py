@@ -92,11 +92,14 @@ class SiteMotifEncoder(nn.Module):
         h_center = h[:, c]                                   # [N, H]
         scores = (h @ self.attn_w).masked_fill(pad_mask, float('-inf'))
         attn = torch.softmax(scores, dim=1)                  # [N, L]
-        # 全填充行 softmax(全 -inf) 为 NaN：直接置首位置权重 1（该行输出恒为 0 向量）
+        # 全填充行 softmax(全 -inf) 为 NaN：置首位置权重 1（该行 h 恒为 0，输出不受影响）。
+        # 必须用 out-of-place 的 where——softmax 的输出被 autograd 保存用于反向，
+        # inplace 赋值会在 backward 时报 "modified by an inplace operation"
         fully_padded = pad_mask.all(dim=1)
         if fully_padded.any():
-            attn[fully_padded] = 0.0
-            attn[fully_padded, 0] = 1.0
+            fix = torch.zeros_like(attn)
+            fix[:, 0] = 1.0
+            attn = torch.where(fully_padded.unsqueeze(1), fix, attn)
         h_ctx = (h * attn.unsqueeze(-1)).sum(dim=1)          # [N, H]
         return self.readout(torch.cat([h_center, h_ctx], dim=-1))
 
