@@ -97,20 +97,34 @@ def build_protocol():
     site_dim = data['site'].x.size(1)
     site_window = getattr(data['site'], 'window', None)
     motif_len = int(site_window.size(1)) if site_window is not None else 0
+    # L1: ESMC 窗口嵌入——默认启用（图 = GRAPH_PATH 指向的 ..._esmc.pt，必带 esmc_x；
+    # 加载旧图时此处显式报错，避免分支静默缺失导致指标与训练不可比）
+    site_esmc = getattr(data['site'], 'esmc_x', None)
+    if site_esmc is None:
+        raise RuntimeError(
+            "默认配置要求位点 ESMC 特征，但图中缺少 data['site'].esmc_x；"
+            "请先运行 data_prep/add_esmc_features.py 生成带 esmc_x 的图"
+        )
+    esmc_dim = int(site_esmc.size(1))
 
     print(f"协议: cold-start 按激酶划分 | 训练激酶 {len(train_k)}, "
           f"验证激酶 {len(val_k)}({val_edge_index.size(1)} 条边), "
           f"测试激酶 {len(test_k)}({test_edge_index.size(1)} 条边) | "
           f"负采样 {NEG_STRATEGY} x5 | PR-AUC 随机基线 ≈ {1/6:.3f}")
     return (train_data, fixed_pairs, (esm_dim, n2v_dim, site_dim, num_families, motif_len,
-            int(family_group_map.size(1))), family_group_map, retrieval_log)
+            esmc_dim, int(family_group_map.size(1))), family_group_map, retrieval_log)
 
 
 def eval_checkpoint(model, ckpt_path, train_data, fixed_pairs):
     """加载单个 checkpoint，在同一份固定样本上计算 Val/Test AUC、PR-AUC
     与 val 校准阈值的 F1（阈值只从 val 选，test 复用同一阈值）。"""
     state = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    model.load_state_dict(state)
+    # L1: strict=False 容忍新旧 checkpoint 混评——旧 checkpoint 缺 esmc 权重时，
+    # 该分支 gate 保持初始 0（关闭），指标不受随机初始化污染；差异透明打印
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(f"  [注意] {Path(ckpt_path).name}: missing={len(missing)} {list(missing)[:4]}, "
+              f"unexpected={len(unexpected)} {list(unexpected)[:4]}")
     model.eval()
     out = {}
     split_preds = {}
@@ -141,7 +155,7 @@ def main():
         sys.exit(1)
 
     train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
-    esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
+    esm_dim, n2v_dim, site_dim, num_families, motif_len, esmc_dim, num_groups = dims
     # hidden_dim 从 checkpoint 自动推断（训练侧可能改动，如 256→128）
     state0 = torch.load(ckpt_paths[0], map_location=DEVICE, weights_only=False)
     hidden_dim = int(state0['family_prototypes'].shape[1])
@@ -150,7 +164,7 @@ def main():
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
         num_families=num_families, hidden_dim=hidden_dim, num_heads=4,
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
-        motif_len=motif_len,
+        motif_len=motif_len, esmc_dim=esmc_dim,
         num_groups=num_groups, family_group_map=family_group_map,
     ).to(DEVICE)
     # R1: 注入检索谱先验——与训练时一致；漏掉则 R1 分支在评估中静默缺失，指标不可比

@@ -126,6 +126,7 @@ class HGTTransformer(nn.Module):
         dropout: float = 0.2,
         motif_len: int = 0,              # 序列窗口长度；0 表示不使用 motif 特征
         motif_vocab: int = 21,           # 0=填充/未知, 1..20=标准氨基酸
+        esmc_dim: int = 1152,             # L1: 位点 ESMC 窗口嵌入维度（默认启用；0 显式关闭）
         num_groups: int = 0,             # P2-B2 大组数；0 表示不启用大组层级
         family_group_map: torch.Tensor = None,   # [num_families, num_groups] one-hot
     ):
@@ -140,6 +141,14 @@ class HGTTransformer(nn.Module):
                 motif_len, hidden_dim,
                 vocab_size=motif_vocab, num_heads=num_heads, dropout=dropout,
             )
+        # L1: ESMC 窗口 mean 嵌入分支（ESMC-600M 对 31aa 窗口的序列均值池化，
+        # 编码窗口全局语义：酸碱性/组成/蛋白家族感——与 motif 编码器的位置特异性互补）。
+        # gate 初始 0 → 训练起点与原模型完全等价；旧 checkpoint 缺 esmc 权重时
+        # 以 strict=False 加载后该分支保持关闭，指标不受随机初始化污染
+        self.esmc_dim = esmc_dim
+        if esmc_dim > 0:
+            self.esmc_proj = Linear(esmc_dim, hidden_dim)
+            self.esmc_gate = nn.Parameter(torch.tensor(0.0))
 
         # ---- HGT 层（异构消息传递） ----
         # 定义元数据：节点类型和边类型
@@ -294,6 +303,15 @@ class HGTTransformer(nn.Module):
                     "请先运行 data_prep/add_motif_features.py 生成带 window 的图"
                 )
             site_x = site_x + self.motif_encoder(window.to(site_x.device))
+        # L1: ESMC 窗口嵌入分支（gate 软开关）
+        if self.esmc_dim > 0:
+            esmc_x = getattr(data['site'], 'esmc_x', None)
+            if esmc_x is None:
+                raise ValueError(
+                    "模型启用了 ESMC 分支(esmc_dim>0)，但图中缺少 data['site'].esmc_x；"
+                    "请先运行 data_prep/add_esmc_features.py 生成带 esmc_x 的图"
+                )
+            site_x = site_x + self.esmc_gate * self.esmc_proj(esmc_x.to(site_x.device))
 
         # 2. HGT 消息传递
         x_dict = {'kinase': kinase_x, 'site': site_x}

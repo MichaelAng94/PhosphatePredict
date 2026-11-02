@@ -284,18 +284,22 @@ def main():
     splits = ('val', 'test') if args.split == 'both' else (args.split,)
 
     train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
-    esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
+    esm_dim, n2v_dim, site_dim, num_families, motif_len, esmc_dim, num_groups = dims
     state = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
     hidden_dim = int(state['family_prototypes'].shape[1])
     model = HGTTransformer(
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
         num_families=num_families, hidden_dim=hidden_dim, num_heads=4,
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
-        motif_len=motif_len, num_groups=num_groups, family_group_map=family_group_map,
+        motif_len=motif_len, esmc_dim=esmc_dim, num_groups=num_groups,
+        family_group_map=family_group_map,
     ).to(DEVICE)
     # R1: 注入检索谱先验（与训练时一致；漏掉则 R1 分支在分析中静默缺失，指标不可比）
     model.retrieval_profile = retrieval_log.to(DEVICE)
-    model.load_state_dict(state)
+    # L1: strict=False 容忍旧 checkpoint（缺 esmc 权重时 gate 保持 0，分支关闭）
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(f"[注意] missing={len(missing)}, unexpected={len(unexpected)}（esmc 分支按 gate=0 关闭）")
     model.eval()
 
     kinase_names = train_data['kinase'].node_names

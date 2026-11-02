@@ -48,7 +48,9 @@ plt.rcParams['axes.titlesize'] = 11
 
 # ==================== 配置参数 ====================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-GRAPH_PATH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph_motif.pt")
+# 默认使用带 ESMC 窗口嵌入的图（data_prep/add_esmc_features.py 生成）；
+# 无 ESMC 的旧图 joint_hetero_graph_motif.pt 保留为备份
+GRAPH_PATH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph_motif_esmc.pt")
 KINASE_FAMILY_FILE = str(PROJECT_ROOT / "origin_data/kinase_family.xls")   # 列名: Name, Family
 
 LINK_PRED_BATCH_SIZE = 2000      # 每次采样多少正样本对
@@ -888,6 +890,16 @@ def main():
     site_window = getattr(data['site'], 'window', None)
     motif_len = int(site_window.size(1)) if site_window is not None else 0
     logging.info(f"位点 motif 特征: {'启用, 窗口长度 ' + str(motif_len) if motif_len else '未启用'}")
+    # L1: ESMC 窗口 mean 嵌入——默认启用的位点特征（图中必须带 esmc_x）
+    site_esmc = getattr(data['site'], 'esmc_x', None)
+    if site_esmc is None:
+        raise RuntimeError(
+            "默认配置要求位点 ESMC 特征，但图中缺少 data['site'].esmc_x；"
+            "请先运行 data_prep/add_esmc_features.py 生成 "
+            "origin_data/joint_hetero_graph_motif_esmc.pt（或改回旧图路径并显式关闭 ESMC）"
+        )
+    esmc_dim = int(site_esmc.size(1))
+    logging.info(f"位点 ESMC 特征: 启用, 维度 {esmc_dim}")
     model = HGTTransformer(
         esm_dim=esm_dim,
         n2v_dim=n2v_dim,
@@ -899,6 +911,7 @@ def main():
         num_transformer_layers=1,
         dropout=0.15,
         motif_len=motif_len,
+        esmc_dim=esmc_dim,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
     ).to(DEVICE)

@@ -4,3 +4,4 @@ origin_data/PSEA.txt
 origin_data/RegPhos.txt
 /origin_data/kinase
 /origin_data/substate
+*.pyc

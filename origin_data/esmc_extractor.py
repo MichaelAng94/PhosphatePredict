@@ -228,6 +228,6 @@ def extract_homolog_embeddings(fasta_file, db):
     return
 
 if __name__=="__main__":
-    fasta_file='origin_data/kinase_sequences_uniprot.fasta'
-    output_dir='origin_data/kinase'
+    fasta_file='origin_data/all_windows.fasta'
+    output_dir='origin_data/substate/out/'
     fasta2esm(fasta_file,output_dir)
