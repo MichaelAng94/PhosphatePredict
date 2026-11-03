@@ -5,3 +5,5 @@ origin_data/RegPhos.txt
 /origin_data/kinase
 /origin_data/substate
 *.pyc
+origin_data/all_windows.fasta
+origin_data/joint_hetero_graph_motif_esmc.pt

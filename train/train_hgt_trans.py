@@ -91,7 +91,7 @@ LR_PATIENCE = 3
 LR_FACTOR = 0.5
 LR_MIN = 1e-6
 EPOCHS = 2000
-EARLY_STOPPING_PATIENCE = 30
+EARLY_STOPPING_PATIENCE = 20
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -905,11 +905,11 @@ def main():
         n2v_dim=n2v_dim,
         site_dim=site_dim,
         num_families=num_families,
-        hidden_dim=192,
+        hidden_dim=128,
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.15,
+        dropout=0.25,
         motif_len=motif_len,
         esmc_dim=esmc_dim,
         num_groups=int(family_group_map.size(1)),
