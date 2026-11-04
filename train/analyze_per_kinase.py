@@ -34,7 +34,7 @@ from model.hgt_transformer import HGTTransformer
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('checkpoint', nargs='?', default=str(PROJECT_ROOT / 'model/best_joint_model_new.pt'))
+    p.add_argument('checkpoint', nargs='?', default=str(PROJECT_ROOT / 'model/best_joint_model_20261103_214237.pt'))
     p.add_argument('--split', choices=('test', 'val', 'both'), default='test')
     p.add_argument('--outdir', default=str(PROJECT_ROOT / 'analysis/per_kinase'))
     p.add_argument('--rank-batch-size', type=int, default=8192)
@@ -284,14 +284,14 @@ def main():
     splits = ('val', 'test') if args.split == 'both' else (args.split,)
 
     train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
-    esm_dim, n2v_dim, site_dim, num_families, motif_len, esmc_dim, num_groups = dims
+    esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
     state = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
     hidden_dim = int(state['family_prototypes'].shape[1])
     model = HGTTransformer(
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
         num_families=num_families, hidden_dim=hidden_dim, num_heads=4,
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
-        motif_len=motif_len, esmc_dim=esmc_dim, num_groups=num_groups,
+        motif_len=motif_len, num_groups=num_groups,
         family_group_map=family_group_map,
     ).to(DEVICE)
     # R1: 注入检索谱先验（与训练时一致；漏掉则 R1 分支在分析中静默缺失，指标不可比）

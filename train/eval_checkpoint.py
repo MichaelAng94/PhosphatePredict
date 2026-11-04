@@ -97,22 +97,13 @@ def build_protocol():
     site_dim = data['site'].x.size(1)
     site_window = getattr(data['site'], 'window', None)
     motif_len = int(site_window.size(1)) if site_window is not None else 0
-    # L1: ESMC 窗口嵌入——默认启用（图 = GRAPH_PATH 指向的 ..._esmc.pt，必带 esmc_x；
-    # 加载旧图时此处显式报错，避免分支静默缺失导致指标与训练不可比）
-    site_esmc = getattr(data['site'], 'esmc_x', None)
-    if site_esmc is None:
-        raise RuntimeError(
-            "默认配置要求位点 ESMC 特征，但图中缺少 data['site'].esmc_x；"
-            "请先运行 data_prep/add_esmc_features.py 生成带 esmc_x 的图"
-        )
-    esmc_dim = int(site_esmc.size(1))
 
     print(f"协议: cold-start 按激酶划分 | 训练激酶 {len(train_k)}, "
           f"验证激酶 {len(val_k)}({val_edge_index.size(1)} 条边), "
           f"测试激酶 {len(test_k)}({test_edge_index.size(1)} 条边) | "
           f"负采样 {NEG_STRATEGY} x5 | PR-AUC 随机基线 ≈ {1/6:.3f}")
     return (train_data, fixed_pairs, (esm_dim, n2v_dim, site_dim, num_families, motif_len,
-            esmc_dim, int(family_group_map.size(1))), family_group_map, retrieval_log)
+            int(family_group_map.size(1))), family_group_map, retrieval_log)
 
 
 def eval_checkpoint(model, ckpt_path, train_data, fixed_pairs):
