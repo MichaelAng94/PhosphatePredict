@@ -901,7 +901,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.25,
+        dropout=0.35,
         motif_len=motif_len,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
