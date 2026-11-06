@@ -77,7 +77,7 @@ RANKING_MARGIN = 1.0              # L3 排序损失间隔
 EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的训练激酶比例（其磷酸化边只退出消息传递，仍计入损失）
 # ---- P1 排序目标改造 ----
 HARD_NEG_PROBS = (0.4, 0.3, 0.3)  # 训练负样本策略混合比例: (随机tail, 同家族激酶head, 同蛋白位点tail)
-DEGREE_ALPHA = 0.5                # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
+DEGREE_ALPHA = 0                # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
 LAMBDA_NCE = 0.4                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
