@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-无 Transformer + multi-positive InfoNCE：激酶家族分类 + 激酶-底物关系预测。
+Transformer 消融实验：激酶家族分类 + 激酶-底物关系预测。
 共享 GNN 编码器仅保留 HGT；全局 Transformer 替换为 Identity，最终 LayerNorm 保留。
-对比损失使用 batch 内所有已知真边作为正样本，而非仅使用对角线正例。
-其余数据划分、随机种子、损失函数及训练超参数保持不变。
+除移除全局 Transformer 外，数据划分、随机种子、损失函数及训练超参数均与
+train_hgt_trans.py 保持一致，用于单独衡量全局自注意力模块的贡献。
 
 划分协议（链接预测）：SPLIT_MODE='kinase' 时按激酶整体留出（cold-start），
   验证/测试激酶的全部磷酸化边不进入训练图，模拟暗激酶（无已知底物）的零样本条件；
@@ -511,27 +511,6 @@ def build_fixed_eval_pairs(edge_index, num_neg, num_kinase, num_site,
     return pos_k, pos_s, neg_k, neg_s
 
 # ==================== 训练和评估函数（支持掩码）====================
-def multi_positive_info_nce(logits, positive_mask):
-    """按 anchor 计算 multi-positive InfoNCE。
-
-    logits[i, j] 是第 i 个 anchor 与第 j 个候选的打分；positive_mask[i, j]
-    表示该配对是已知正样本。每个 anchor 的所有正样本先平均 log 概率，
-    再对至少含一个负候选的有效 anchor 求均值。
-    """
-    positive_mask = positive_mask.bool()
-    pos_count = positive_mask.sum(dim=1)
-    valid = (pos_count > 0) & (pos_count < logits.size(1))
-    if not valid.any():
-        # 没有可比较的负候选时，该方向不提供对比学习梯度。
-        return logits.sum() * 0.0
-    log_probs = F.log_softmax(logits, dim=1)
-    per_anchor = -(
-        log_probs.masked_fill(~positive_mask, 0.0).sum(dim=1)
-        / pos_count.clamp_min(1)
-    )
-    return per_anchor[valid].mean()
-
-
 def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
                 optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
                 hard_ctx=None, edge_weights=None):
@@ -612,9 +591,8 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
     )
     loss_rank = F.relu(RANKING_MARGIN - pos_logits + neg_logits[neg_sel_idx]).mean()
 
-    # 4. L4 批内 multi-positive InfoNCE：子批内所有 (k_i, s_j) 交叉打分。
-    # 每个 anchor 的所有已知真边都参与 softmax 分子与分母；非正配对仍作为负候选。
-    # 元素级掩码同时覆盖同激酶多位点、同位点多激酶及重复采样，不再只认对角线。
+    # 4. L4 批内对比损失（InfoNCE）：子批内所有 (k_i, s_j) 交叉打分，对角线为正，
+    # 非对角的已知真边从分母剔除；双向 CE 直接优化"真底物排在其它位点前"——与 PR-AUC 语义对齐
     loss_nce = torch.tensor(0.0, device=pos_logits.device)
     if LAMBDA_NCE > 0 and n_pos >= 2 and hard_ctx is not None:
         m = min(NCE_BATCH, n_pos)
@@ -625,18 +603,17 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         pair_logits = model.interaction_logits(
             kinase_emb, site_emb, ki, sj, fam_probs=fam_probs
         ).view(m, m)
+        # 剔除非对角的已知真边（不作为负样本参与分母）
         with torch.no_grad():
-            keys = ki * num_site + sj
-            positive_mask = torch.isin(
-                keys, hard_ctx['true_edge_keys_t']
-            ).view(m, m)
-            # 采样对本身必为正例；显式补齐对角线以防索引构建不一致。
-            positive_mask = positive_mask | torch.eye(
-                m, dtype=torch.bool, device=pair_logits.device
-            )
+            keys = (ki * num_site + sj).cpu().numpy()
+            is_true = np.isin(keys, hard_ctx['true_edge_keys'])
+            eye = np.eye(m, dtype=bool)
+            block = torch.tensor(is_true.reshape(m, m) & ~eye, device=pair_logits.device)
+        pair_logits = pair_logits.masked_fill(block, float('-inf'))
+        tgt = torch.arange(m, device=pair_logits.device)
         loss_nce = 0.5 * (
-            multi_positive_info_nce(pair_logits / NCE_TEMP, positive_mask)
-            + multi_positive_info_nce(pair_logits.t() / NCE_TEMP, positive_mask.t())
+            F.cross_entropy(pair_logits / NCE_TEMP, tgt)
+            + F.cross_entropy(pair_logits.t() / NCE_TEMP, tgt)
         )
 
     # P2-B2: 大组辅助分类损失（~12 大组 vs 130 细家族，每大组样本多得多，统计更稳）
@@ -800,7 +777,7 @@ def select_best_f1_threshold(labels, preds):
     
 # ==================== 主程序 ====================
 def main():
-    logging.info("无 Transformer + multi-positive InfoNCE；其余训练设置保持不变")
+    logging.info("Transformer 消融：全局 Transformer = Identity，其余设置与 train_hgt_trans.py 一致")
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
     logging.info("加载异构图...")
