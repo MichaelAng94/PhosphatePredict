@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-无 Transformer + 去检索底物谱消融：激酶家族分类 + 激酶-底物关系预测。
+无 Transformer + 预测大组引导的检索底物谱：激酶家族分类 + 激酶-底物关系预测。
 共享 GNN 编码器仅保留 HGT；全局 Transformer 替换为 Identity，最终 LayerNorm 保留。
-保留 ESM similar_to 图边，但关闭检索底物谱先验及其负采样反污染；
+保留 ESM similar_to 图边，恢复检索底物谱及其负采样反污染，并用当前模型预测的
+大组概率对 ESM 近邻进行软重加权；查询激酶不使用真实家族/大组标签。
 DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超参数保持不变。
 
 划分协议（链接预测）：SPLIT_MODE='kinase' 时按激酶整体留出（cold-start），
@@ -45,13 +46,79 @@ from model.hgt_transformer import HGTTransformer
 
 
 class HGTTransformerNoTransformer(HGTTransformer):
-    """仅消融全局 Transformer，保留 HGT、输入投影及最终 LayerNorm。"""
+    """无全局 Transformer，并支持预测大组引导的动态检索谱。"""
 
     def __init__(self, *args, **kwargs):
         # 不创建 TransformerEncoder 参数；Identity 让原 forward 的其余流程保持不变。
         kwargs['num_transformer_layers'] = 0
         super().__init__(*args, **kwargs)
         self.transformer_encoder = nn.Identity()
+        # 以下检索张量均为普通属性，不进入 state_dict；与训练图/划分绑定，初始化后注入。
+        self.retrieval_neighbor_index = None
+        self.retrieval_neighbor_similarity = None
+        self.retrieval_neighbor_group = None
+        self.retrieval_source_profile = None
+        self.retrieval_confidence = None
+        self.retrieval_tau = 0.05
+        self.retrieval_scale = 10.0
+        self.retrieval_group_eps = 0.1
+
+    def configure_group_retrieval(self, neighbor_index, neighbor_similarity,
+                                  source_profile, confidence, source_group_labels,
+                                  tau, scale, group_eps):
+        """注入训练近邻与训练边；查询端大组概率始终在 interaction_logits 中预测。"""
+        device = next(self.parameters()).device
+        self.retrieval_neighbor_index = neighbor_index.to(device=device, dtype=torch.long)
+        self.retrieval_neighbor_similarity = neighbor_similarity.to(device=device, dtype=torch.float32)
+        self.retrieval_source_profile = source_profile.to(device=device, dtype=torch.float32)
+        self.retrieval_confidence = confidence.to(device=device, dtype=torch.float32)
+        # 只会在近邻索引（全部属于链接训练激酶）上查真实大组；冷启动查询激酶不查标签。
+        self.retrieval_neighbor_group = source_group_labels.to(
+            device=device, dtype=torch.long
+        )[self.retrieval_neighbor_index]
+        self.retrieval_tau = float(tau)
+        self.retrieval_scale = float(scale)
+        self.retrieval_group_eps = float(group_eps)
+        # 禁用父类的静态 ESM 检索谱，避免重复加分。
+        self.retrieval_profile = None
+
+    def group_retrieval_raw_for_pairs(self, k_idx, s_idx, fam_probs):
+        """返回当前预测大组下、未做 log/conf 调制的逐样本检索谱值。"""
+        if self.retrieval_neighbor_index is None or self.retrieval_neighbor_index.size(1) == 0:
+            return torch.zeros_like(k_idx, dtype=torch.float32)
+        # p_group(k) = softmax(family_logits) @ family_group_map；不使用查询激酶真实标签。
+        group_probs = fam_probs @ self.family_group_map             # [K, G]
+        neighbors = self.retrieval_neighbor_index[k_idx]            # [B, M]
+        neighbor_groups = self.retrieval_neighbor_group[k_idx]      # [B, M]，-1 表示无标签
+        valid_group = neighbor_groups >= 0
+        safe_groups = neighbor_groups.clamp_min(0)
+        known_compat = self.retrieval_group_eps + group_probs[k_idx].gather(1, safe_groups)
+        # 无标签近邻按均匀大组分布处理：eps + 1/G，保持中性且不硬丢弃。
+        neutral_compat = self.retrieval_group_eps + 1.0 / group_probs.size(1)
+        compat = torch.where(valid_group, known_compat,
+                             torch.full_like(known_compat, neutral_compat))
+        # softmax(sim/tau) * compat 后重新归一化，等价于 softmax(sim/tau + log(compat))。
+        logits = (self.retrieval_neighbor_similarity[k_idx] / self.retrieval_tau
+                  + torch.log(compat.clamp_min(1e-8)))
+        weights = torch.softmax(logits, dim=-1)                     # [B, M]
+        neighbor_sites = self.retrieval_source_profile[
+            neighbors, s_idx.unsqueeze(1)
+        ]                                                           # [B, M]
+        return (weights * neighbor_sites).sum(dim=-1)
+
+    def interaction_logits(self, kinase_emb, site_emb, k_idx, s_idx, fam_probs=None):
+        if self.retrieval_neighbor_index is None:
+            return super().interaction_logits(
+                kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
+            )
+        if fam_probs is None:
+            fam_probs = torch.softmax(self.predict_family(kinase_emb), dim=-1)
+        out = super().interaction_logits(
+            kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
+        )
+        raw = self.group_retrieval_raw_for_pairs(k_idx, s_idx, fam_probs)
+        prior = torch.log1p(raw * self.retrieval_scale) * self.retrieval_confidence[k_idx]
+        return out + self.retrieval_gate * prior
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,11 +156,12 @@ ESM_FALLBACK_K = 1               # B1: 保底邻居数——低于阈值的激�
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 # ---- R1 检索式底物谱先验 ----
-USE_RETRIEVAL_PROFILE = False   # 去检索谱消融：同时关闭解码先验和基于谱的负样本反污染
+USE_RETRIEVAL_PROFILE = True    # 启用动态大组检索谱和基于谱的负样本反污染
 RETRIEVAL_TOP_M = 20              # 每个激酶检索的 ESM 近邻训练激酶数（谱的支撑面）
 RETRIEVAL_TAU = 0.05              # 检索 softmax 温度（越小越接近硬 kNN，越大越接近家族均值）
 RETRIEVAL_SCALE = 10.0            # 谱值 log1p 前的线性缩放（控制先验动态范围）
 RETRIEVAL_NEG_MAX = 0.15          # 负样本反污染阈值：raw 谱值超此值的候选负样本重采（疑似未标注真底物）
+RETRIEVAL_GROUP_EPS = 0.1         # 大组软加权下限；越大越接近原 ESM 检索，0 为最强组兼容约束
 # R1.1 置信度调制：与最近训练激酶的 ESM 相似度低于 CENTER 的激酶逐步关闭谱先验
 # （ESM 相似 ≠ 底物相似——孤立/非典型激酶的错误先验比无先验更糟，如 TAF1/RON）
 RETRIEVAL_CONF_CENTER = 0.85      # 置信度中心（top1 相似度等于此值时 conf=0.5）
@@ -316,7 +384,8 @@ def _generate_negatives(pos_k, pos_s, num_kinase, num_site,
 
 def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
                             top_m=20, tau=0.05, scale=10.0,
-                            conf_center=0.85, conf_temp=0.04):
+                            conf_center=0.85, conf_temp=0.04,
+                            return_neighbors=False):
     """R1: 检索式底物谱先验——对每个激酶 k，按 ESM 余弦相似度检索 top_m 个
     **训练激酶**，softmax(sim/tau) 加权累加它们的训练底物指示向量，得到 k 的
     近邻底物谱 profile[k, s]。谱经 log1p(profile*scale) 压缩量级后作为非参数
@@ -326,22 +395,32 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     后注入——与最近训练激酶序列相似度高的激酶（近亲明确，如 P38D/AURC）完全信任谱；
     相似度低于 conf_center 的孤立/非典型激酶（ESM 近亲的底物谱是错误先验，
     如 TAF1/RON——R1 轮实测 AUC 被压到 0.18 出现反排序）自动衰减到近 0。
-    conf 烘焙进谱矩阵（模型/评估代码零改动）；conf_center=-inf 时 conf≡1 回退 R1。
+    静态返回谱中烘焙 conf；动态大组版本则在逐对打分时施加同一 conf。
+    conf_center=-inf 时 conf≡1 回退无置信度调制的 R1。
 
     与 kNN 相似边（P2-B1，传"表示"）互补：检索谱直接传"边本身"，无学习自由度、
     无过拟合面，冷启动激酶可无损继承近亲的底物特异性。
     只用训练激酶/训练边构建，零标注泄漏。
     返回 (conf 调制谱 [K,S], 原始谱 [K,S], 置信度 [K])——
     原始谱（不含 conf）另用于训练负样本反污染。
+    return_neighbors=True 时追加近邻索引、相似度和训练底物矩阵，供预测大组动态重加权；
+    默认返回三元素，保持其他评估脚本的调用兼容。
     """
     K = esm.size(0)
     device = esm.device
     train_kinase_mask = train_kinase_mask.to(device)   # 调用方可能在 CPU 上传掩码
     m = min(top_m, int(train_kinase_mask.sum().item()))
     if m <= 0:
-        return (torch.zeros(K, num_site, device=device),
-                torch.zeros(K, num_site, device=device),
-                torch.zeros(K, device=device))
+        result = (torch.zeros(K, num_site, device=device),
+                  torch.zeros(K, num_site, device=device),
+                  torch.zeros(K, device=device))
+        if return_neighbors:
+            return result + ({
+                'neighbor_index': torch.empty(K, 0, dtype=torch.long, device=device),
+                'neighbor_similarity': torch.empty(K, 0, device=device),
+                'source_profile': torch.zeros(K, num_site, device=device),
+            },)
+        return result
     esm_n = F.normalize(esm, dim=-1)
     sim = esm_n @ esm_n.t()                       # [K, K]
     sim[:, ~train_kinase_mask] = -1.0             # 只检索训练激酶（冷启动激酶不作检索源）
@@ -359,10 +438,17 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     profile = torch.zeros(K, num_site, device=device)
     for j in range(m):
         profile += w[:, j].unsqueeze(1) * A[topi[:, j]]
-    del A
     # R1.1: 置信度由与最近训练激酶的相似度调制
     conf = torch.sigmoid((topv[:, 0] - conf_center) / conf_temp)
-    return torch.log1p(profile * scale) * conf.unsqueeze(1), profile, conf
+    result = (torch.log1p(profile * scale) * conf.unsqueeze(1), profile, conf)
+    if return_neighbors:
+        return result + ({
+            'neighbor_index': topi,
+            'neighbor_similarity': topv,
+            'source_profile': A,
+        },)
+    del A
+    return result
 
 def _generate_mixed_negatives(pos_k, pos_s, num_kinase, num_site,
                               kinase_sites, site_kinases,
@@ -564,7 +650,13 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         n_pos_t = pos_k.size(0)
         for _ in range(10):
             keys = neg_k * num_site + neg_s
-            bad = ((raw[neg_k, neg_s] > RETRIEVAL_NEG_MAX)
+            with torch.no_grad():
+                if hasattr(model, 'group_retrieval_raw_for_pairs'):
+                    # 与解码器一致，使用当前预测大组下的动态谱值进行反污染。
+                    raw_values = model.group_retrieval_raw_for_pairs(neg_k, neg_s, fam_probs)
+                else:
+                    raw_values = raw[neg_k, neg_s]
+            bad = ((raw_values > RETRIEVAL_NEG_MAX)
                    | torch.isin(keys, hard_ctx['true_edge_keys_t']))
             if not bad.any():
                 break
@@ -778,7 +870,7 @@ def select_best_f1_threshold(labels, preds):
     
 # ==================== 主程序 ====================
 def main():
-    logging.info("消融：无 Transformer + 无检索底物谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
+    logging.info("实验：无 Transformer + 预测大组软重加权检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
     logging.info("加载异构图...")
@@ -862,17 +954,19 @@ def main():
     group_labels = group_labels.to(DEVICE)
     logging.info(f"P2-B2: {num_families} 个家族聚为 {int(family_group_map.size(1))} 个大组")
 
-    # R1: 检索式底物谱先验。去检索谱消融时跳过构建，避免额外显存/内存开销。
-    # 检索源始终只使用链接预测训练边；similar_to 图边不受此开关影响。
+    # R1: 检索源始终只使用链接预测训练边；similar_to 图边不受此开关影响。
+    # 除静态谱（用于覆盖率和反污染诊断）外，保留近邻与训练底物矩阵供动态大组重加权。
     retrieval_log = None
     retrieval_raw = None
+    retrieval_neighbors = None
     if USE_RETRIEVAL_PROFILE:
         retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
         retrieval_kmask[train_edge_index[0]] = True
-        retrieval_log, retrieval_raw, retrieval_conf = build_retrieval_profile(
+        retrieval_log, retrieval_raw, retrieval_conf, retrieval_neighbors = build_retrieval_profile(
             data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
             top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
             conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
+            return_neighbors=True,
         )
         covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
         low_conf = (retrieval_conf < 0.25).float().mean().item()
@@ -891,6 +985,10 @@ def main():
                  if n in _kname_list]
         logging.info("R1.1 conf 诊断: " + ", ".join(
             f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))
+        logging.info(
+            f"R1.2: 启用预测大组软重加权，eps={RETRIEVAL_GROUP_EPS}；"
+            "查询端仅用预测概率，训练近邻端使用其真实大组，权重按近邻候选重新归一化"
+        )
     else:
         logging.info("R1 消融：不构建、不注入检索底物谱，也不进行谱驱动的负样本反污染")
 
@@ -925,9 +1023,22 @@ def main():
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
     ).to(DEVICE)
-    # R1: None 时 interaction_logits 不经过检索谱分支，retrieval_gate 不参与前向计算。
-    model.retrieval_profile = retrieval_log.to(DEVICE) if retrieval_log is not None else None
-    
+    # R1.2: 动态检索不注入父类静态 retrieval_profile；训练、验证、测试均在打分时
+    # 根据当前 kinase_emb 的预测大组概率重加权。checkpoint 加载后这些非参数属性仍在。
+    if retrieval_neighbors is not None:
+        model.configure_group_retrieval(
+            neighbor_index=retrieval_neighbors['neighbor_index'],
+            neighbor_similarity=retrieval_neighbors['neighbor_similarity'],
+            source_profile=retrieval_neighbors['source_profile'],
+            confidence=retrieval_conf,
+            source_group_labels=group_labels,
+            tau=RETRIEVAL_TAU,
+            scale=RETRIEVAL_SCALE,
+            group_eps=RETRIEVAL_GROUP_EPS,
+        )
+    else:
+        model.retrieval_profile = None
+
     # 6. 损失函数与优化器
     criterion_class = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_link = nn.BCEWithLogitsLoss()   # 配合 interaction_logits，数值上比 BCELoss(sigmoid) 更稳定
