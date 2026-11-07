@@ -40,6 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.hgt_transformer import HGTTransformer
+from full_rank_eval import evaluate_full_candidate_ranking, format_full_rank_short
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'DejaVu Sans']
@@ -69,6 +70,11 @@ LAMBDA_NCE = 0.4                  # L4 批内对比损失权重（InfoNCE，直�
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
 STEPS_PER_EPOCH = 6              # A: 每 epoch 采样+梯度更新次数（L1 边丢弃随每次采样刷新，等效步数 ×K）
+# ---- B: 全候选 listwise 排序目标（训练对齐真实应用口径：给定激酶在全部位点中排序）----
+LAMBDA_LIST = 0.3                # B listwise 损失权重；0 关闭
+LIST_TEMP = 0.5                  # B 温度（logits/τ 后做全候选 softmax；τ 越小越聚焦 top 错误）
+LIST_KINASES = 8                 # B 每步参与全候选 listwise 的激酶数（显存 OOM 时调小）
+FULL_RANK_EVERY = 25             # B 训练期每 N 个 epoch 在 val 上跑一次全候选监控（0=只在结束时算）
 # ---- P2 结构改造 ----
 ESM_KNN_K = 10                   # B1: ESM-kNN 候选池大小（每个激酶考虑 top-K 相似邻居）
 ESM_SIM_MIN = 0.75               # B1: 余弦相似度下限——候选低于此值不连边（自适应度数，防噪声边）
@@ -132,15 +138,17 @@ def load_checkpoint(path=CKPT_PATH, retries=5):
     raise RuntimeError(f"无法读取 checkpoint: {path}")
 
 # ==================== 加载数据 ====================
-def load_kinase_family_labels(kinase_nodes, family_file):
+def load_kinase_family_labels(kinase_nodes, family_file, return_names=False):
     """
     加载激酶家族标签。
     参数:
         kinase_nodes: list, 所有激酶节点名称（按字母排序，与图中顺序一致）
         family_file: 文件路径（包含 Name, Family 两列）
+        return_names: bool, 额外返回家族名列表（按标签 id 排序，供全候选评估的家族分层用）
     返回:
         labels: torch.LongTensor, 长度为 len(kinase_nodes)，没有标签的为 -1（忽略）
         num_classes: int
+        family_names: list（仅 return_names=True 时）
     """
     df = pd.read_excel(family_file)
     # 归一化激酶名称（与构建图时一致：大写，不删数字）
@@ -162,6 +170,8 @@ def load_kinase_family_labels(kinase_nodes, family_file):
     labels = torch.tensor(labels, dtype=torch.long)
     num_classes = len(families)
     logging.info(f"激酶家族类别数: {num_classes}, 有标签的激酶数: {(labels != -1).sum().item()}")
+    if return_names:
+        return labels, num_classes, list(le.classes_)
     return labels, num_classes
 
 def add_esm_knn_edges(data, k=10, sim_min=0.75):
@@ -498,6 +508,39 @@ def build_fixed_eval_pairs(edge_index, num_neg, num_kinase, num_site,
     return pos_k, pos_s, neg_k, neg_s
 
 # ==================== 训练和评估函数（支持掩码）====================
+def full_candidate_listwise_loss(model, kinase_emb, site_emb, fam_probs,
+                                 train_edge_index, num_site, g=8, temp=0.5):
+    """B: 每步随机抽 g 个训练激酶，在每个激酶的**全部位点候选池**上做多正 listwise softmax：
+        L_k = -log( Σ_{j∈正底物} exp(s_j/τ) / Σ_{j∈全部位点} exp(s_j/τ) )
+    分母覆盖全部位点（含正例），softmax 结构天然把最强梯度给到模型当前最误信的
+    位点——即隐式 hard negative mining，直接对齐全候选排序评估口径
+    （Recall@K / 正例中位秩），与随机 1:5 负采样的逐边 BCE/L4 批内交叉互补。
+    仅用训练边构造正标签，无协议泄漏。"""
+    device = train_edge_index.device
+    train_k = torch.unique(train_edge_index[0])
+    g = min(g, train_k.size(0))
+    pick = torch.unique(train_k[torch.randint(0, train_k.size(0), (g,), device=device)])
+    g = pick.size(0)
+    if g == 0:
+        return torch.tensor(0.0, device=device)
+    # 全候选打分 [g, S]：一次性向量化（B=g*S 对），显存随 g 线性，OOM 时调小 LIST_KINASES
+    k_idx = pick.repeat_interleave(num_site)
+    s_idx = torch.arange(num_site, device=device).repeat(g)
+    scores = model.interaction_logits(
+        kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
+    ).view(g, num_site) / temp
+    # 正标签 mask：被选中激酶的训练真边
+    in_pick = torch.isin(train_edge_index[0], pick)
+    pe, ps = train_edge_index[0][in_pick], train_edge_index[1][in_pick]
+    num_kinase = kinase_emb.size(0)
+    lookup = torch.full((num_kinase,), -1, dtype=torch.long, device=device)
+    lookup[pick] = torch.arange(g, device=device)
+    pos_mask = torch.zeros(g, num_site, dtype=torch.bool, device=device)
+    pos_mask[lookup[pe], ps] = True
+    pos_logsum = torch.logsumexp(scores.masked_fill(~pos_mask, float('-inf')), dim=1)
+    return (torch.logsumexp(scores, dim=1) - pos_logsum).mean()
+
+
 def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
                 optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
                 hard_ctx=None, edge_weights=None):
@@ -603,6 +646,15 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
             + F.cross_entropy(pair_logits.t() / NCE_TEMP, tgt)
         )
 
+    # B: 全候选 listwise 排序损失——每个激酶在全部位点池上的多正 softmax，
+    # 对齐全候选评估口径（Recall@K/中位秩），隐式 hard negative mining
+    loss_list = torch.tensor(0.0, device=pos_logits.device)
+    if LAMBDA_LIST > 0:
+        loss_list = full_candidate_listwise_loss(
+            model, kinase_emb, site_emb, fam_probs,
+            train_edge_index, num_site, g=LIST_KINASES, temp=LIST_TEMP
+        )
+
     # P2-B2: 大组辅助分类损失（~12 大组 vs 130 细家族，每大组样本多得多，统计更稳）
     loss_group = torch.tensor(0.0, device=pos_logits.device)
     if hard_ctx is not None and 'group_labels' in hard_ctx:
@@ -612,7 +664,8 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
             loss_group = criterion_class(g_logits[gmask], hard_ctx['group_labels'][gmask])
 
     loss = (LAMBDA_FAMILY * loss_family + LAMBDA_LINK * loss_link
-            + LAMBDA_RANK * loss_rank + LAMBDA_NCE * loss_nce + LAMBDA_GROUP * loss_group)
+            + LAMBDA_RANK * loss_rank + LAMBDA_NCE * loss_nce
+            + LAMBDA_LIST * loss_list + LAMBDA_GROUP * loss_group)
     loss.backward()
     clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
@@ -623,6 +676,7 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         'link':   LAMBDA_LINK * loss_link.detach().item(),
         'rank':   LAMBDA_RANK * loss_rank.detach().item(),
         'nce':    LAMBDA_NCE * loss_nce.detach().item(),
+        'list':   LAMBDA_LIST * loss_list.detach().item(),
         'group':  LAMBDA_GROUP * loss_group.detach().item(),
     }
 
@@ -774,7 +828,8 @@ def main():
     logging.info(f"激酶节点数: {num_kinase}, 底物节点数: {num_site}")
     
     # 2. 加载激酶家族标签
-    kinase_labels, num_families = load_kinase_family_labels(kinase_names, KINASE_FAMILY_FILE)
+    kinase_labels, num_families, family_names = load_kinase_family_labels(
+        kinase_names, KINASE_FAMILY_FILE, return_names=True)
     kinase_labels = kinase_labels.to(DEVICE)
     
     # 3. 获取模型输入维度
@@ -985,7 +1040,8 @@ def main():
                 comp[k] = comp.get(k, 0.0) + v / STEPS_PER_EPOCH
         loss = sum(comp.values())
         comp_str = (f"fam {comp['family']:.3f} | link {comp['link']:.3f} | "
-                    f"rank {comp['rank']:.3f} | nce {comp['nce']:.3f} | grp {comp['group']:.3f}")
+                    f"rank {comp['rank']:.3f} | nce {comp['nce']:.3f} | "
+                    f"list {comp.get('list', 0.0):.3f} | grp {comp['group']:.3f}")
         
         # 每 5 个 epoch 评估一次（嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）
         if epoch % 5 == 0:
@@ -1005,6 +1061,15 @@ def main():
                 f"Val F1*(thr={results['val_thr_cal']:.3f}): {results['val_f1_cal']:.4f}, "
                 f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f}"
             )
+
+            # B: 全候选排序监控（真实应用口径）——低频率、只报紧凑行，详细报告留给训练结束
+            if FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0:
+                fr_val = evaluate_full_candidate_ranking(
+                    model, train_data, val_edge_index, num_site,
+                    kinase_labels=kinase_labels, family_names=family_names,
+                    kinase_names=kinase_names, split_name='val', verbose=False,
+                )
+                logging.info(f"  [全候选/val] {format_full_rank_short(fr_val, 'val')}")
 
             if epoch > 400:
                 if val_pr_auc > best_val_auc:
@@ -1050,6 +1115,25 @@ def main():
         f"参考上界: test 自身最优阈值 F1 = {final_results['test_f1_cal']:.4f} @ {final_results['test_thr_cal']:.4f}"
         f"（阈值已接触测试数据，仅用于诊断阈值漂移，不作为正式指标）"
     )
+
+    # B: 全候选排序最终报告（真实应用口径：给定激酶在全部位点中排序）。
+    # 未标注位点按负例，绝对值保守，只用于相对比较与分层诊断，不与 1:5 负采样 PR-AUC 互比
+    logging.info("==== 全候选排序评估（未标注位点按负例，绝对值偏保守，用于相对比较）====")
+    fr_final = {}
+    for split_name, eidx in (('val', val_edge_index), ('test', test_edge_index)):
+        fr_final[split_name] = evaluate_full_candidate_ranking(
+            model, train_data, eidx, num_site,
+            kinase_labels=kinase_labels, family_names=family_names,
+            kinase_names=kinase_names, split_name=split_name,
+            save_csv=True, verbose=True,
+        )
+    fr_t = fr_final.get('test') or {}
+    if fr_t:
+        logging.info(
+            f"全候选汇总: test Macro-AP = {fr_t['macro_ap']:.4f}, 加权AP = {fr_t['weighted_ap']:.4f}, "
+            f"池化AP = {fr_t['pooled_ap']:.4f}, MRR = {fr_t['pooled_mrr']:.4f}, "
+            f"正例中位秩 = {fr_t['pooled_median_rank']:.0f}"
+        )
 
     # 获取训练、验证、测试集的预测结果（嵌入统一由 train_data 计算）
     train_preds, train_labels = get_link_pred_predictions(
