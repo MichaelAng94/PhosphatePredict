@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Transformer 消融实验：激酶家族分类 + 激酶-底物关系预测。
+无 Transformer + 去检索底物谱消融：激酶家族分类 + 激酶-底物关系预测。
 共享 GNN 编码器仅保留 HGT；全局 Transformer 替换为 Identity，最终 LayerNorm 保留。
-除移除全局 Transformer 外，数据划分、随机种子、损失函数及训练超参数均与
-train_hgt_trans.py 保持一致，用于单独衡量全局自注意力模块的贡献。
+保留 ESM similar_to 图边，但关闭检索底物谱先验及其负采样反污染；
+DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超参数保持不变。
 
 划分协议（链接预测）：SPLIT_MODE='kinase' 时按激酶整体留出（cold-start），
   验证/测试激酶的全部磷酸化边不进入训练图，模拟暗激酶（无已知底物）的零样本条件；
@@ -77,7 +77,7 @@ RANKING_MARGIN = 1.0              # L3 排序损失间隔
 EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的训练激酶比例（其磷酸化边只退出消息传递，仍计入损失）
 # ---- P1 排序目标改造 ----
 HARD_NEG_PROBS = (0.4, 0.3, 0.3)  # 训练负样本策略混合比例: (随机tail, 同家族激酶head, 同蛋白位点tail)
-DEGREE_ALPHA = 0                # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
+DEGREE_ALPHA = 0.5              # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
 LAMBDA_NCE = 0.4                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
@@ -89,6 +89,7 @@ ESM_FALLBACK_K = 1               # B1: 保底邻居数——低于阈值的激�
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 # ---- R1 检索式底物谱先验 ----
+USE_RETRIEVAL_PROFILE = False   # 去检索谱消融：同时关闭解码先验和基于谱的负样本反污染
 RETRIEVAL_TOP_M = 20              # 每个激酶检索的 ESM 近邻训练激酶数（谱的支撑面）
 RETRIEVAL_TAU = 0.05              # 检索 softmax 温度（越小越接近硬 kNN，越大越接近家族均值）
 RETRIEVAL_SCALE = 10.0            # 谱值 log1p 前的线性缩放（控制先验动态范围）
@@ -777,7 +778,7 @@ def select_best_f1_threshold(labels, preds):
     
 # ==================== 主程序 ====================
 def main():
-    logging.info("Transformer 消融：全局 Transformer = Identity，其余设置与 train_hgt_trans.py 一致")
+    logging.info("消融：无 Transformer + 无检索底物谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
     logging.info("加载异构图...")
@@ -861,34 +862,37 @@ def main():
     group_labels = group_labels.to(DEVICE)
     logging.info(f"P2-B2: {num_families} 个家族聚为 {int(family_group_map.size(1))} 个大组")
 
-    # R1: 检索式底物谱先验——每个激酶按 ESM 相似度检索 top-m 训练激酶，
-    # softmax 加权累加其训练底物谱（只用训练激酶/训练边，零标注泄漏）。
-    # 检索源 = 链接预测训练边涉及的激酶（train_edge_index 的行），而非分类掩码——
-    # 分类划分与边划分相互独立，谱的支撑面必须与训练边严格对齐
-    retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
-    retrieval_kmask[train_edge_index[0]] = True
-    retrieval_log, retrieval_raw, retrieval_conf = build_retrieval_profile(
-        data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
-        top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
-        conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
-    )
-    covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
-    low_conf = (retrieval_conf < 0.25).float().mean().item()
-    logging.info(
-        f"R1: 检索谱先验 top{RETRIEVAL_TOP_M}/tau={RETRIEVAL_TAU} 构建完成，"
-        f"有非零谱的激酶占比 {covered:.1%}（其余激酶无近邻训练底物可继承，退化为纯学习分支）"
-    )
-    logging.info(
-        f"R1.1: 置信度调制 center={RETRIEVAL_CONF_CENTER}/temp={RETRIEVAL_CONF_TEMP}，"
-        f"conf 中位数 {retrieval_conf.median():.3f}，低置信(<0.25)激酶 {low_conf:.1%}"
-        f"（谱先验自动关闭，防错误先验）"
-    )
-    # 诊断：A 类（预期低 conf）与 C 类（预期高 conf）抽查——验证调制方向
-    _kname_list = list(kinase_names)
-    _diag = [n for n in ('TAF1', 'RON', 'PKM', 'CHAK2', 'LKB1', 'VRK1', 'AURC', 'P38D', 'EGFR', 'TTK')
-             if n in _kname_list]
-    logging.info("R1.1 conf 诊断: " + ", ".join(
-        f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))
+    # R1: 检索式底物谱先验。去检索谱消融时跳过构建，避免额外显存/内存开销。
+    # 检索源始终只使用链接预测训练边；similar_to 图边不受此开关影响。
+    retrieval_log = None
+    retrieval_raw = None
+    if USE_RETRIEVAL_PROFILE:
+        retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
+        retrieval_kmask[train_edge_index[0]] = True
+        retrieval_log, retrieval_raw, retrieval_conf = build_retrieval_profile(
+            data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
+            top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
+            conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
+        )
+        covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
+        low_conf = (retrieval_conf < 0.25).float().mean().item()
+        logging.info(
+            f"R1: 检索谱先验 top{RETRIEVAL_TOP_M}/tau={RETRIEVAL_TAU} 构建完成，"
+            f"有非零谱的激酶占比 {covered:.1%}（其余激酶无近邻训练底物可继承，退化为纯学习分支）"
+        )
+        logging.info(
+            f"R1.1: 置信度调制 center={RETRIEVAL_CONF_CENTER}/temp={RETRIEVAL_CONF_TEMP}，"
+            f"conf 中位数 {retrieval_conf.median():.3f}，低置信(<0.25)激酶 {low_conf:.1%}"
+            f"（谱先验自动关闭，防错误先验）"
+        )
+        # 诊断：A 类（预期低 conf）与 C 类（预期高 conf）抽查——验证调制方向
+        _kname_list = list(kinase_names)
+        _diag = [n for n in ('TAF1', 'RON', 'PKM', 'CHAK2', 'LKB1', 'VRK1', 'AURC', 'P38D', 'EGFR', 'TTK')
+                 if n in _kname_list]
+        logging.info("R1.1 conf 诊断: " + ", ".join(
+            f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))
+    else:
+        logging.info("R1 消融：不构建、不注入检索底物谱，也不进行谱驱动的负样本反污染")
 
     train_data = data.clone()
     train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
@@ -921,8 +925,8 @@ def main():
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
     ).to(DEVICE)
-    # R1: 非参数谱矩阵注入（普通张量属性，不进 state_dict；eval_checkpoint 需同样注入才能复现协议）
-    model.retrieval_profile = retrieval_log.to(DEVICE)
+    # R1: None 时 interaction_logits 不经过检索谱分支，retrieval_gate 不参与前向计算。
+    model.retrieval_profile = retrieval_log.to(DEVICE) if retrieval_log is not None else None
     
     # 6. 损失函数与优化器
     criterion_class = nn.CrossEntropyLoss(ignore_index=-1)
@@ -966,11 +970,12 @@ def main():
         'site_protein': site_protein,
         'protein_sites': dict(protein_sites),
         'true_edge_keys': true_edge_keys,
-        'retrieval_raw': retrieval_raw,            # R1: 原始谱，负样本反污染用
         'true_edge_keys_t': torch.as_tensor(true_edge_keys, dtype=torch.long, device=DEVICE),
         'group_labels': group_labels,
         'family_group_map': family_group_map.to(DEVICE),
     }
+    if USE_RETRIEVAL_PROFILE:
+        hard_ctx['retrieval_raw'] = retrieval_raw  # 仅启用检索谱时进行谱驱动负样本反污染
     logging.info(
         f"P1 难负上下文: 有家族标签激酶 {sum(len(v) for v in family_kinases.values())}, "
         f"蛋白 {len(protein_sites)} 个（多位点蛋白 {sum(1 for v in protein_sites.values() if len(v) > 1)} 个）"
