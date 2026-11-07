@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-无 Transformer + 预测大组引导的检索底物谱：激酶家族分类 + 激酶-底物关系预测。
+无 Transformer + 原始 ESM 检索底物谱：激酶家族分类 + 激酶-底物关系预测。
 共享 GNN 编码器仅保留 HGT；全局 Transformer 替换为 Identity，最终 LayerNorm 保留。
-保留 ESM similar_to 图边，恢复检索底物谱及其负采样反污染，并用当前模型预测的
-大组概率对 ESM 近邻进行软重加权；查询激酶不使用真实家族/大组标签。
+保留 ESM similar_to 图边、静态检索底物谱及其负采样反污染，不使用大组重加权。
 DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超参数保持不变。
 
 划分协议（链接预测）：SPLIT_MODE='kinase' 时按激酶整体留出（cold-start），
@@ -14,6 +13,11 @@ DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超�
   避免验证/测试边泄漏进 HGT 消息传递导致指标虚高。
 负采样：对正样本做单侧破坏（默认保留激酶替换位点），并以全量正边索引过滤，
   避免把未标注的真实边（尤其暗激酶的边）当作负样本。
+评估口径（两套并列，不可互相替代）：
+  1) 随机 1:5 负采样 PR-AUC —— "能否区分少量随机负样本"，用于模型选择；
+  2) A1 全候选排序（FULL_RANK_EVAL）—— 每个激酶在**全部位点**上排序，报告
+     Recall@K / Precision@K / Hits@K / MRR / 正例中位秩 / full AP，并按已知底物数
+     与家族分层；未标注位点按负例处理，绝对值偏保守，用于衡量真实候选可发现性。
 """
 
 from collections import defaultdict
@@ -46,79 +50,13 @@ from model.hgt_transformer import HGTTransformer
 
 
 class HGTTransformerNoTransformer(HGTTransformer):
-    """无全局 Transformer，并支持预测大组引导的动态检索谱。"""
+    """仅消融全局 Transformer，保留 HGT、输入投影及最终 LayerNorm。"""
 
     def __init__(self, *args, **kwargs):
         # 不创建 TransformerEncoder 参数；Identity 让原 forward 的其余流程保持不变。
         kwargs['num_transformer_layers'] = 0
         super().__init__(*args, **kwargs)
         self.transformer_encoder = nn.Identity()
-        # 以下检索张量均为普通属性，不进入 state_dict；与训练图/划分绑定，初始化后注入。
-        self.retrieval_neighbor_index = None
-        self.retrieval_neighbor_similarity = None
-        self.retrieval_neighbor_group = None
-        self.retrieval_source_profile = None
-        self.retrieval_confidence = None
-        self.retrieval_tau = 0.05
-        self.retrieval_scale = 10.0
-        self.retrieval_group_eps = 0.1
-
-    def configure_group_retrieval(self, neighbor_index, neighbor_similarity,
-                                  source_profile, confidence, source_group_labels,
-                                  tau, scale, group_eps):
-        """注入训练近邻与训练边；查询端大组概率始终在 interaction_logits 中预测。"""
-        device = next(self.parameters()).device
-        self.retrieval_neighbor_index = neighbor_index.to(device=device, dtype=torch.long)
-        self.retrieval_neighbor_similarity = neighbor_similarity.to(device=device, dtype=torch.float32)
-        self.retrieval_source_profile = source_profile.to(device=device, dtype=torch.float32)
-        self.retrieval_confidence = confidence.to(device=device, dtype=torch.float32)
-        # 只会在近邻索引（全部属于链接训练激酶）上查真实大组；冷启动查询激酶不查标签。
-        self.retrieval_neighbor_group = source_group_labels.to(
-            device=device, dtype=torch.long
-        )[self.retrieval_neighbor_index]
-        self.retrieval_tau = float(tau)
-        self.retrieval_scale = float(scale)
-        self.retrieval_group_eps = float(group_eps)
-        # 禁用父类的静态 ESM 检索谱，避免重复加分。
-        self.retrieval_profile = None
-
-    def group_retrieval_raw_for_pairs(self, k_idx, s_idx, fam_probs):
-        """返回当前预测大组下、未做 log/conf 调制的逐样本检索谱值。"""
-        if self.retrieval_neighbor_index is None or self.retrieval_neighbor_index.size(1) == 0:
-            return torch.zeros_like(k_idx, dtype=torch.float32)
-        # p_group(k) = softmax(family_logits) @ family_group_map；不使用查询激酶真实标签。
-        group_probs = fam_probs @ self.family_group_map             # [K, G]
-        neighbors = self.retrieval_neighbor_index[k_idx]            # [B, M]
-        neighbor_groups = self.retrieval_neighbor_group[k_idx]      # [B, M]，-1 表示无标签
-        valid_group = neighbor_groups >= 0
-        safe_groups = neighbor_groups.clamp_min(0)
-        known_compat = self.retrieval_group_eps + group_probs[k_idx].gather(1, safe_groups)
-        # 无标签近邻按均匀大组分布处理：eps + 1/G，保持中性且不硬丢弃。
-        neutral_compat = self.retrieval_group_eps + 1.0 / group_probs.size(1)
-        compat = torch.where(valid_group, known_compat,
-                             torch.full_like(known_compat, neutral_compat))
-        # softmax(sim/tau) * compat 后重新归一化，等价于 softmax(sim/tau + log(compat))。
-        logits = (self.retrieval_neighbor_similarity[k_idx] / self.retrieval_tau
-                  + torch.log(compat.clamp_min(1e-8)))
-        weights = torch.softmax(logits, dim=-1)                     # [B, M]
-        neighbor_sites = self.retrieval_source_profile[
-            neighbors, s_idx.unsqueeze(1)
-        ]                                                           # [B, M]
-        return (weights * neighbor_sites).sum(dim=-1)
-
-    def interaction_logits(self, kinase_emb, site_emb, k_idx, s_idx, fam_probs=None):
-        if self.retrieval_neighbor_index is None:
-            return super().interaction_logits(
-                kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
-            )
-        if fam_probs is None:
-            fam_probs = torch.softmax(self.predict_family(kinase_emb), dim=-1)
-        out = super().interaction_logits(
-            kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
-        )
-        raw = self.group_retrieval_raw_for_pairs(k_idx, s_idx, fam_probs)
-        prior = torch.log1p(raw * self.retrieval_scale) * self.retrieval_confidence[k_idx]
-        return out + self.retrieval_gate * prior
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -156,16 +94,26 @@ ESM_FALLBACK_K = 1               # B1: 保底邻居数——低于阈值的激�
 NUM_KINASE_GROUPS = 12           # B2: 家族→大组层级的大组数（KMeans 聚家族 ESM 质心）
 LAMBDA_GROUP = 0.5               # B2: 大组辅助分类损失权重
 # ---- R1 检索式底物谱先验 ----
-USE_RETRIEVAL_PROFILE = True    # 启用动态大组检索谱和基于谱的负样本反污染
+USE_RETRIEVAL_PROFILE = True    # 启用原始静态 ESM 检索谱和基于谱的负样本反污染
 RETRIEVAL_TOP_M = 20              # 每个激酶检索的 ESM 近邻训练激酶数（谱的支撑面）
 RETRIEVAL_TAU = 0.05              # 检索 softmax 温度（越小越接近硬 kNN，越大越接近家族均值）
 RETRIEVAL_SCALE = 10.0            # 谱值 log1p 前的线性缩放（控制先验动态范围）
 RETRIEVAL_NEG_MAX = 0.15          # 负样本反污染阈值：raw 谱值超此值的候选负样本重采（疑似未标注真底物）
-RETRIEVAL_GROUP_EPS = 0.1         # 大组软加权下限；越大越接近原 ESM 检索，0 为最强组兼容约束
 # R1.1 置信度调制：与最近训练激酶的 ESM 相似度低于 CENTER 的激酶逐步关闭谱先验
 # （ESM 相似 ≠ 底物相似——孤立/非典型激酶的错误先验比无先验更糟，如 TAF1/RON）
 RETRIEVAL_CONF_CENTER = 0.85      # 置信度中心（top1 相似度等于此值时 conf=0.5）
 RETRIEVAL_CONF_TEMP = 0.04        # 置信度温度（越小开关越陡）
+# ---- A1 全候选排序评估（方向 A）----
+# 随机 1:5 负采样下的 PR-AUC 只反映"能否区分少量随机负样本"；
+# 全候选排序把每个激酶放到全部位点上排序，直接对应真实候选空间的可发现性。
+# 未标注位点按负例处理（保守口径），因此绝对值偏低，重点是相对比较与分层结构。
+FULL_RANK_EVAL = True             # 是否启用全候选排序指标
+FULL_RANK_KS = (10, 20, 50, 100)  # Recall@K 的 K 列表
+FULL_RANK_HIT_KS = (1, 10, 20)    # Hits@K：top-K 内至少命中一个真实底物的激酶比例
+FULL_RANK_EVERY = 25              # 训练期每隔多少 epoch 在 val 上算一次（0=训练期不算，只算最终）
+FULL_RANK_MAX_KINASES = 0         # 训练期监控最多评估的激酶数（0=全部；最终评估恒为全部）
+FULL_RANK_SITE_CHUNK = 8192       # 位点分块大小，控制显存
+FULL_RANK_OUT_DIR = str(PROJECT_ROOT / "analysis/full_rank")  # 逐激酶/家族/分层结果输出目录
 LEARNING_RATE = 9e-5
 # LR 调度：连续 LR_PATIENCE 次评估（每次间隔 5 epoch）Val PR-AUC 不涨则降半档，
 # 下限 LR_MIN；与早停独立，不重置早停计数器
@@ -214,15 +162,17 @@ def load_checkpoint(path=CKPT_PATH, retries=5):
     raise RuntimeError(f"无法读取 checkpoint: {path}")
 
 # ==================== 加载数据 ====================
-def load_kinase_family_labels(kinase_nodes, family_file):
+def load_kinase_family_labels(kinase_nodes, family_file, return_names=False):
     """
     加载激酶家族标签。
     参数:
         kinase_nodes: list, 所有激酶节点名称（按字母排序，与图中顺序一致）
         family_file: 文件路径（包含 Name, Family 两列）
+        return_names: 额外返回 id→家族名列表（LabelEncoder 的类别顺序，供分层报告使用）
     返回:
         labels: torch.LongTensor, 长度为 len(kinase_nodes)，没有标签的为 -1（忽略）
         num_classes: int
+        family_names: list[str]（仅 return_names=True 时）
     """
     df = pd.read_excel(family_file)
     # 归一化激酶名称（与构建图时一致：大写，不删数字）
@@ -244,6 +194,8 @@ def load_kinase_family_labels(kinase_nodes, family_file):
     labels = torch.tensor(labels, dtype=torch.long)
     num_classes = len(families)
     logging.info(f"激酶家族类别数: {num_classes}, 有标签的激酶数: {(labels != -1).sum().item()}")
+    if return_names:
+        return labels, num_classes, [str(c) for c in le.classes_]
     return labels, num_classes
 
 def add_esm_knn_edges(data, k=10, sim_min=0.75):
@@ -384,8 +336,7 @@ def _generate_negatives(pos_k, pos_s, num_kinase, num_site,
 
 def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
                             top_m=20, tau=0.05, scale=10.0,
-                            conf_center=0.85, conf_temp=0.04,
-                            return_neighbors=False):
+                            conf_center=0.85, conf_temp=0.04):
     """R1: 检索式底物谱先验——对每个激酶 k，按 ESM 余弦相似度检索 top_m 个
     **训练激酶**，softmax(sim/tau) 加权累加它们的训练底物指示向量，得到 k 的
     近邻底物谱 profile[k, s]。谱经 log1p(profile*scale) 压缩量级后作为非参数
@@ -395,32 +346,22 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     后注入——与最近训练激酶序列相似度高的激酶（近亲明确，如 P38D/AURC）完全信任谱；
     相似度低于 conf_center 的孤立/非典型激酶（ESM 近亲的底物谱是错误先验，
     如 TAF1/RON——R1 轮实测 AUC 被压到 0.18 出现反排序）自动衰减到近 0。
-    静态返回谱中烘焙 conf；动态大组版本则在逐对打分时施加同一 conf。
-    conf_center=-inf 时 conf≡1 回退无置信度调制的 R1。
+    conf 烘焙进谱矩阵；conf_center=-inf 时 conf≡1 回退无置信度调制的 R1。
 
     与 kNN 相似边（P2-B1，传"表示"）互补：检索谱直接传"边本身"，无学习自由度、
     无过拟合面，冷启动激酶可无损继承近亲的底物特异性。
     只用训练激酶/训练边构建，零标注泄漏。
     返回 (conf 调制谱 [K,S], 原始谱 [K,S], 置信度 [K])——
     原始谱（不含 conf）另用于训练负样本反污染。
-    return_neighbors=True 时追加近邻索引、相似度和训练底物矩阵，供预测大组动态重加权；
-    默认返回三元素，保持其他评估脚本的调用兼容。
     """
     K = esm.size(0)
     device = esm.device
     train_kinase_mask = train_kinase_mask.to(device)   # 调用方可能在 CPU 上传掩码
     m = min(top_m, int(train_kinase_mask.sum().item()))
     if m <= 0:
-        result = (torch.zeros(K, num_site, device=device),
-                  torch.zeros(K, num_site, device=device),
-                  torch.zeros(K, device=device))
-        if return_neighbors:
-            return result + ({
-                'neighbor_index': torch.empty(K, 0, dtype=torch.long, device=device),
-                'neighbor_similarity': torch.empty(K, 0, device=device),
-                'source_profile': torch.zeros(K, num_site, device=device),
-            },)
-        return result
+        return (torch.zeros(K, num_site, device=device),
+                torch.zeros(K, num_site, device=device),
+                torch.zeros(K, device=device))
     esm_n = F.normalize(esm, dim=-1)
     sim = esm_n @ esm_n.t()                       # [K, K]
     sim[:, ~train_kinase_mask] = -1.0             # 只检索训练激酶（冷启动激酶不作检索源）
@@ -438,17 +379,10 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     profile = torch.zeros(K, num_site, device=device)
     for j in range(m):
         profile += w[:, j].unsqueeze(1) * A[topi[:, j]]
+    del A
     # R1.1: 置信度由与最近训练激酶的相似度调制
     conf = torch.sigmoid((topv[:, 0] - conf_center) / conf_temp)
-    result = (torch.log1p(profile * scale) * conf.unsqueeze(1), profile, conf)
-    if return_neighbors:
-        return result + ({
-            'neighbor_index': topi,
-            'neighbor_similarity': topv,
-            'source_profile': A,
-        },)
-    del A
-    return result
+    return torch.log1p(profile * scale) * conf.unsqueeze(1), profile, conf
 
 def _generate_mixed_negatives(pos_k, pos_s, num_kinase, num_site,
                               kinase_sites, site_kinases,
@@ -650,13 +584,7 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         n_pos_t = pos_k.size(0)
         for _ in range(10):
             keys = neg_k * num_site + neg_s
-            with torch.no_grad():
-                if hasattr(model, 'group_retrieval_raw_for_pairs'):
-                    # 与解码器一致，使用当前预测大组下的动态谱值进行反污染。
-                    raw_values = model.group_retrieval_raw_for_pairs(neg_k, neg_s, fam_probs)
-                else:
-                    raw_values = raw[neg_k, neg_s]
-            bad = ((raw_values > RETRIEVAL_NEG_MAX)
+            bad = ((raw[neg_k, neg_s] > RETRIEVAL_NEG_MAX)
                    | torch.isin(keys, hard_ctx['true_edge_keys_t']))
             if not bad.any():
                 break
@@ -868,9 +796,255 @@ def select_best_f1_threshold(labels, preds):
     i = int(np.argmax(f1[:-1]))          # f1 末位无对应阈值，排除
     return float(thr[i]), float(f1[i])
     
+# ==================== A1 全候选排序评估 ====================
+def _score_kinase_all_sites(model, kinase_emb, site_emb, k_id, num_site,
+                            fam_probs=None, site_chunk=FULL_RANK_SITE_CHUNK):
+    """单个激酶在全部位点上的打分（logit）。logit 与概率严格单调等价，排序指标不变。"""
+    device = kinase_emb.device
+    out = torch.empty(num_site, dtype=torch.float32, device=device)
+    for start in range(0, num_site, site_chunk):
+        end = min(start + site_chunk, num_site)
+        s_idx = torch.arange(start, end, dtype=torch.long, device=device)
+        k_idx = torch.full((end - start,), int(k_id), dtype=torch.long, device=device)
+        out[start:end] = model.interaction_logits(
+            kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
+        )
+    return out
+
+
+def _npos_bin(n):
+    """按已知底物数分层：区分"底物丰富"与"底物稀疏"激酶的可发现性差异。"""
+    n = int(n)
+    if n <= 5:
+        return '1-5'
+    if n <= 20:
+        return '6-20'
+    if n <= 50:
+        return '21-50'
+    return '>50'
+
+
+def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
+                                    ks=FULL_RANK_KS, hit_ks=FULL_RANK_HIT_KS,
+                                    kinase_labels=None, family_names=None,
+                                    kinase_names=None, max_kinases=0,
+                                    site_chunk=FULL_RANK_SITE_CHUNK,
+                                    split_name='test', save_csv=False,
+                                    out_dir=FULL_RANK_OUT_DIR, date_tag=None,
+                                    verbose=True):
+    """
+    A1 全候选排序评估：把每个激酶放到**全部位点**上排序。
+    给出随机 1:5 负采样看不到的三类信息：
+      1. 候选空间可发现性：Recall@K / Precision@K / Hits@K / MRR / 正例中位秩；
+      2. 逐激酶 full AP（未标注位点按负例，保守口径），并区分宏平均与按正边数加权；
+      3. 按已知底物数与家族分层的失败结构。
+    说明：本口径把"未标注位点"当作负例，绝对值偏低，只用于相对比较和分层诊断，
+        不能与随机负采样 PR-AUC 直接对比；正式主指标仍以 val 选择、test 报告为准。
+    返回：标量汇总指标 dict（逐激酶明细见 CSV）。
+    """
+    model.eval()
+    ks = tuple(sorted({int(k) for k in ks if int(k) > 0})) or (50,)
+    hit_ks = tuple(sorted({int(k) for k in hit_ks if int(k) > 0}))
+    tag = date_tag or date_str
+
+    with torch.no_grad():
+        emb = model(embed_data)
+        kinase_emb, site_emb = emb['kinase'], emb['site']
+        num_site = min(int(num_site), int(site_emb.size(0)))
+        # 家族概率只算一次，避免每个位点分块重复前向
+        fam_probs = torch.softmax(model.predict_family(kinase_emb), dim=-1)
+
+        ek = edge_index[0].detach().cpu().numpy()
+        es = edge_index[1].detach().cpu().numpy()
+        pos_by_k = defaultdict(set)
+        for kv, sv in zip(ek, es):
+            if sv < num_site:
+                pos_by_k[int(kv)].add(int(sv))
+
+        items = sorted(pos_by_k.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        n_kin_total = len(items)
+        if max_kinases and int(max_kinases) > 0:
+            items = items[:int(max_kinases)]
+
+        rows = []
+        pooled_scores, pooled_labels, pooled_ranks = [], [], []
+        for k_id, site_set in tqdm(items, desc=f'全候选排序[{split_name}]', leave=False):
+            scores = _score_kinase_all_sites(
+                model, kinase_emb, site_emb, k_id, num_site,
+                fam_probs=fam_probs, site_chunk=site_chunk
+            ).cpu().numpy()
+            # 一次性排出全部位点名次（1 为最高分）；并列按稳定排序处理
+            order = np.argsort(-scores, kind='stable')
+            rank = np.empty(num_site, dtype=np.int64)
+            rank[order] = np.arange(1, num_site + 1)
+
+            pos = np.fromiter(site_set, dtype=np.int64, count=len(site_set))
+            pos_ranks = rank[pos]
+            n_pos = int(pos.size)
+
+            label_vec = np.zeros(num_site, dtype=np.int8)
+            label_vec[pos] = 1
+            ap = float(average_precision_score(label_vec, scores))
+
+            fam_id = -1
+            if kinase_labels is not None:
+                fam_id = int(kinase_labels[k_id].item()) if torch.is_tensor(kinase_labels) \
+                    else int(kinase_labels[k_id])
+            fam_name = (family_names[fam_id] if (family_names is not None and fam_id >= 0)
+                        else 'UNLABELED')
+            k_name = (str(kinase_names[k_id]) if kinase_names is not None else str(k_id))
+
+            row = {
+                'kinase_id': int(k_id), 'kinase': k_name, 'family': fam_name,
+                'family_id': fam_id, 'n_pos': n_pos, 'n_site': num_site,
+                'full_ap': ap,
+                'mrr': float(np.mean(1.0 / pos_ranks)),
+                'median_rank': float(np.median(pos_ranks)),
+                'mean_rank': float(np.mean(pos_ranks)),
+                'best_rank': int(pos_ranks.min()),
+            }
+            for K in ks:
+                hit_cnt = int((pos_ranks <= K).sum())
+                row[f'recall@{K}'] = hit_cnt / n_pos
+                row[f'precision@{K}'] = hit_cnt / K
+            for K in hit_ks:
+                row[f'hit@{K}'] = float(bool((pos_ranks <= K).any()))
+            rows.append(row)
+
+            pooled_scores.append(scores.astype(np.float32, copy=False))
+            pooled_labels.append(label_vec)
+            pooled_ranks.append(pos_ranks)
+
+        del fam_probs
+
+    if not rows:
+        logging.warning(f"[全候选/{split_name}] 该 split 无正边，跳过")
+        return {}
+
+    df = pd.DataFrame(rows)
+    n_pos_total = int(df['n_pos'].sum())
+    w = df['n_pos'].to_numpy(dtype=np.float64)
+    w_sum = float(w.sum())
+
+    def _macro(col):
+        return float(df[col].mean())
+
+    def _wmean(col):
+        return float((df[col].to_numpy(dtype=np.float64) * w).sum() / w_sum)
+
+    pooled_ap = float(average_precision_score(
+        np.concatenate(pooled_labels), np.concatenate(pooled_scores)
+    ))
+    # 正例层面的池化统计（每条真边等权）：比"逐激酶中位秩再加权平均"更易解释
+    all_pos_ranks = np.concatenate(pooled_ranks).astype(np.float64)
+    pooled_median_rank = float(np.median(all_pos_ranks))
+    pooled_mrr = float(np.mean(1.0 / all_pos_ranks))
+    del pooled_labels, pooled_scores, pooled_ranks, all_pos_ranks
+
+    fr = {
+        'n_kinases': int(len(df)), 'n_kinases_total': int(n_kin_total),
+        'n_pos': n_pos_total, 'n_site': int(num_site),
+        'macro_ap': _macro('full_ap'), 'weighted_ap': _wmean('full_ap'),
+        'pooled_ap': pooled_ap,
+        'macro_mrr': _macro('mrr'), 'weighted_mrr': _wmean('mrr'),
+        'pooled_mrr': pooled_mrr,
+        'pooled_median_rank': pooled_median_rank,
+    }
+    for K in ks:
+        fr[f'macro_recall@{K}'] = _macro(f'recall@{K}')
+        fr[f'weighted_recall@{K}'] = _wmean(f'recall@{K}')
+    for K in hit_ks:
+        fr[f'hit@{K}_rate'] = _macro(f'hit@{K}')
+
+    if verbose:
+        ks_str = ' / '.join(
+            f"@{K} {fr[f'weighted_recall@{K}']:.3f}(宏 {fr[f'macro_recall@{K}']:.3f})"
+            for K in ks
+        )
+        hit_str = ' / '.join(f"@{K} {fr[f'hit@{K}_rate']:.3f}" for K in hit_ks)
+        logging.info(
+            f"[全候选/{split_name}] 激酶 {fr['n_kinases']}/{fr['n_kinases_total']} | "
+            f"正边 {n_pos_total} | 候选位点 {num_site}"
+        )
+        logging.info(
+            f"[全候选/{split_name}] AP: 宏平均 {fr['macro_ap']:.4f} | "
+            f"按正边加权 {fr['weighted_ap']:.4f} | 池化 {fr['pooled_ap']:.4f}"
+        )
+        logging.info(
+            f"[全候选/{split_name}] Recall(加权/宏) {ks_str} | "
+            f"MRR 池化 {fr['pooled_mrr']:.4f}/加权 {fr['weighted_mrr']:.4f}/宏 {fr['macro_mrr']:.4f} | "
+            f"正例池化中位秩 {fr['pooled_median_rank']:.0f}"
+        )
+        logging.info(f"[全候选/{split_name}] Hits@K（激酶命中率）{hit_str}")
+
+        # 分层：已知底物数
+        for b in ('1-5', '6-20', '21-50', '>50'):
+            sub = df[df['n_pos'].map(_npos_bin) == b]
+            if sub.empty:
+                continue
+            sw = sub['n_pos'].to_numpy(dtype=np.float64)
+            k50 = 'recall@50' if 'recall@50' in df.columns else f"recall@{ks[-1]}"
+            logging.info(
+                f"[全候选/{split_name}] 分层 n_pos={b}: 激酶 {len(sub)}, 正边 {int(sw.sum())}, "
+                f"AP 宏 {sub['full_ap'].mean():.4f}/加权 "
+                f"{(sub['full_ap'].to_numpy() * sw).sum() / max(sw.sum(), 1e-9):.4f}, "
+                f"Recall@50 加权 {(sub[k50].to_numpy() * sw).sum() / max(sw.sum(), 1e-9):.4f}"
+            )
+
+        # 分层：家族（只报 n_kinases>=1 且按加权 AP 升序的前后各 3 个）
+        fam_rows = {}
+        for fam_name, sub in df.groupby('family'):
+            sw = sub['n_pos'].to_numpy(dtype=np.float64)
+            fam_rows[fam_name] = {
+                'n_kinases': int(len(sub)), 'n_pos': int(sw.sum()),
+                'ap_weighted': float((sub['full_ap'].to_numpy() * sw).sum() / max(sw.sum(), 1e-9)),
+                'ap_macro': float(sub['full_ap'].mean()),
+                'recall@50_weighted': float((sub['recall@50'].to_numpy() * sw).sum() / max(sw.sum(), 1e-9))
+                if 'recall@50' in df.columns else float('nan'),
+                'mrr_weighted': float((sub['mrr'].to_numpy() * sw).sum() / max(sw.sum(), 1e-9)),
+            }
+        fam_df = pd.DataFrame(fam_rows).T.astype(float).sort_values('ap_weighted')
+        worst = fam_df.head(3)
+        logging.info(
+            f"[全候选/{split_name}] 家族拖累 Top3（按加权 AP）: " + ", ".join(
+                f"{name}={r['ap_weighted']:.3f}(n_pos={int(r['n_pos'])})"
+                for name, r in worst.iterrows()
+            )
+        )
+
+        if save_csv:
+            os.makedirs(out_dir, exist_ok=True)
+            p_kin = os.path.join(out_dir, f"{split_name}_per_kinase_{tag}.csv")
+            df.sort_values('full_ap').to_csv(p_kin, index=False, encoding='utf-8-sig')
+            p_fam = os.path.join(out_dir, f"{split_name}_family_{tag}.csv")
+            fam_df.to_csv(p_fam, encoding='utf-8-sig')
+            logging.info(f"[全候选/{split_name}] 明细已保存: {p_kin} | {p_fam}")
+
+    return fr
+
+
+def _format_full_rank_short(fr, split_name='val'):
+    """训练期紧凑日志：只报最能反映"真实可发现性"的几个量。"""
+    if not fr:
+        return '不适用'
+    parts = [f"AP宏 {fr['macro_ap']:.4f}", f"AP加权 {fr['weighted_ap']:.4f}"]
+    for K in (50, 20, 10):
+        key = f'weighted_recall@{K}'
+        if key in fr:
+            parts.append(f"R@{K} {fr[key]:.3f}")
+            break
+    for K in (10, 20, 1):
+        key = f'hit@{K}_rate'
+        if key in fr:
+            parts.append(f"Hits@{K} {fr[key]:.3f}")
+            break
+    parts.append(f"MRR {fr['weighted_mrr']:.3f}")
+    return ' | '.join(parts)
+
+
 # ==================== 主程序 ====================
 def main():
-    logging.info("实验：无 Transformer + 预测大组软重加权检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
+    logging.info("实验：无 Transformer + 原始静态 ESM 检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
     logging.info("加载异构图...")
@@ -882,7 +1056,9 @@ def main():
     logging.info(f"激酶节点数: {num_kinase}, 底物节点数: {num_site}")
     
     # 2. 加载激酶家族标签
-    kinase_labels, num_families = load_kinase_family_labels(kinase_names, KINASE_FAMILY_FILE)
+    kinase_labels, num_families, family_names = load_kinase_family_labels(
+        kinase_names, KINASE_FAMILY_FILE, return_names=True
+    )
     kinase_labels = kinase_labels.to(DEVICE)
     
     # 3. 获取模型输入维度
@@ -954,19 +1130,17 @@ def main():
     group_labels = group_labels.to(DEVICE)
     logging.info(f"P2-B2: {num_families} 个家族聚为 {int(family_group_map.size(1))} 个大组")
 
-    # R1: 检索源始终只使用链接预测训练边；similar_to 图边不受此开关影响。
-    # 除静态谱（用于覆盖率和反污染诊断）外，保留近邻与训练底物矩阵供动态大组重加权。
+    # R1: 检索式底物谱先验。检索源始终只使用链接预测训练边；
+    # similar_to 图边不受此开关影响。
     retrieval_log = None
     retrieval_raw = None
-    retrieval_neighbors = None
     if USE_RETRIEVAL_PROFILE:
         retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
         retrieval_kmask[train_edge_index[0]] = True
-        retrieval_log, retrieval_raw, retrieval_conf, retrieval_neighbors = build_retrieval_profile(
+        retrieval_log, retrieval_raw, retrieval_conf = build_retrieval_profile(
             data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
             top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
             conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
-            return_neighbors=True,
         )
         covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
         low_conf = (retrieval_conf < 0.25).float().mean().item()
@@ -985,10 +1159,6 @@ def main():
                  if n in _kname_list]
         logging.info("R1.1 conf 诊断: " + ", ".join(
             f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))
-        logging.info(
-            f"R1.2: 启用预测大组软重加权，eps={RETRIEVAL_GROUP_EPS}；"
-            "查询端仅用预测概率，训练近邻端使用其真实大组，权重按近邻候选重新归一化"
-        )
     else:
         logging.info("R1 消融：不构建、不注入检索底物谱，也不进行谱驱动的负样本反污染")
 
@@ -1023,21 +1193,9 @@ def main():
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
     ).to(DEVICE)
-    # R1.2: 动态检索不注入父类静态 retrieval_profile；训练、验证、测试均在打分时
-    # 根据当前 kinase_emb 的预测大组概率重加权。checkpoint 加载后这些非参数属性仍在。
-    if retrieval_neighbors is not None:
-        model.configure_group_retrieval(
-            neighbor_index=retrieval_neighbors['neighbor_index'],
-            neighbor_similarity=retrieval_neighbors['neighbor_similarity'],
-            source_profile=retrieval_neighbors['source_profile'],
-            confidence=retrieval_conf,
-            source_group_labels=group_labels,
-            tau=RETRIEVAL_TAU,
-            scale=RETRIEVAL_SCALE,
-            group_eps=RETRIEVAL_GROUP_EPS,
-        )
-    else:
-        model.retrieval_profile = None
+    # R1: 非参数静态谱矩阵注入（普通张量属性，不进 state_dict；
+    # eval_checkpoint 需同样注入才能复现协议）。
+    model.retrieval_profile = retrieval_log.to(DEVICE) if retrieval_log is not None else None
 
     # 6. 损失函数与优化器
     criterion_class = nn.CrossEntropyLoss(ignore_index=-1)
@@ -1137,6 +1295,16 @@ def main():
                 f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f}"
             )
 
+            # A1: 全候选排序监控（训练期只算 val，按 FULL_RANK_EVERY 降频，避免拖慢训练）
+            if FULL_RANK_EVAL and FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0:
+                fr_val = evaluate_full_candidate_ranking(
+                    model, train_data, val_edge_index, num_site,
+                    kinase_labels=kinase_labels, family_names=family_names,
+                    kinase_names=kinase_names, max_kinases=FULL_RANK_MAX_KINASES,
+                    split_name='val', save_csv=False, verbose=False,
+                )
+                logging.info(f"  [全候选/val] {_format_full_rank_short(fr_val)}")
+
             if epoch > 300:
                 if val_pr_auc > best_val_auc:
                     best_val_auc = val_pr_auc
@@ -1181,6 +1349,33 @@ def main():
         f"参考上界: test 自身最优阈值 F1 = {final_results['test_f1_cal']:.4f} @ {final_results['test_thr_cal']:.4f}"
         f"（阈值已接触测试数据，仅用于诊断阈值漂移，不作为正式指标）"
     )
+
+    # A1: 全候选排序（方向 A）——把激酶放到全部位点上排序，衡量真实候选空间的可发现性。
+    # 与上面的随机 1:5 指标并列报告：前者回答"能否在全体位点中排进前列"，
+    # 后者回答"能否区分少量随机负样本"，二者不可互相替代。
+    if FULL_RANK_EVAL:
+        if SPLIT_MODE != 'kinase':
+            logging.warning(
+                "全候选排序指标设计用于 SPLIT_MODE='kinase'（激酶全部边进同一子集）；"
+                "当前按边划分时，split 外的已知边会被当作负例，数值系统性偏低"
+            )
+        logging.info("==== 全候选排序评估（未标注位点按负例，绝对值偏保守，用于相对比较）====")
+        fr_val = evaluate_full_candidate_ranking(
+            model, train_data, val_edge_index, num_site,
+            kinase_labels=kinase_labels, family_names=family_names,
+            kinase_names=kinase_names, split_name='val', save_csv=True,
+        )
+        fr_test = evaluate_full_candidate_ranking(
+            model, train_data, test_edge_index, num_site,
+            kinase_labels=kinase_labels, family_names=family_names,
+            kinase_names=kinase_names, split_name='test', save_csv=True,
+        )
+        logging.info(
+            f"全候选汇总: test Macro-AP = {fr_test['macro_ap']:.4f}, "
+            f"加权AP = {fr_test['weighted_ap']:.4f}, 池化AP = {fr_test['pooled_ap']:.4f}, "
+            f"MRR = {fr_test['pooled_mrr']:.4f}, "
+            f"正例中位秩 = {fr_test['pooled_median_rank']:.0f}"
+        )
 
     # 获取训练、验证、测试集的预测结果（嵌入统一由 train_data 计算）
     train_preds, train_labels = get_link_pred_predictions(
