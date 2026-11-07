@@ -34,7 +34,7 @@ from model.hgt_transformer import HGTTransformer
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('checkpoint', nargs='?', default=str(PROJECT_ROOT / 'model/best_joint_model_no_transformer_20261106_104904.pt'))
+    p.add_argument('checkpoint', nargs='?', default=str(PROJECT_ROOT / 'model/best_joint_model_no_transformer_20261107_112317.pt'))
     p.add_argument('--split', choices=('test', 'val', 'both'), default='test')
     p.add_argument('--outdir', default=str(PROJECT_ROOT / 'analysis/per_kinase'))
     p.add_argument('--rank-batch-size', type=int, default=8192)
