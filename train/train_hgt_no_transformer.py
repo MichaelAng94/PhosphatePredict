@@ -23,6 +23,8 @@ DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超�
 from collections import defaultdict
 from pathlib import Path
 
+import math
+import csv
 import os
 import sys
 import time
@@ -115,13 +117,19 @@ FULL_RANK_MAX_KINASES = 0         # 训练期监控最多评估的激酶数（0=
 FULL_RANK_SITE_CHUNK = 8192       # 位点分块大小，控制显存
 FULL_RANK_OUT_DIR = str(PROJECT_ROOT / "analysis/full_rank")  # 逐激酶/家族/分层结果输出目录
 LEARNING_RATE = 9e-5
-# LR 调度：连续 LR_PATIENCE 次评估（每次间隔 5 epoch）Val PR-AUC 不涨则降半档，
+# 门控/偏置等标定参数单独参数组：它们从 0（或极小值）起步且是整项先验的乘子，
+# Adam 在 lr=9e-5、6 步/epoch 下累计最大位移只有约 0.29，门控会"走不动"，
+# 先验等于从未启用。给它们更高的 lr，才能在训练期内真正被拟合。
+GATE_LR = 5e-4
+GATE_LR_MIN = 1e-4
+# LR 调度：连续 LR_PATIENCE 次评估（每次间隔 EVAL_EVERY epoch）Val PR-AUC 不涨则降半档，
 # 下限 LR_MIN；与早停独立，不重置早停计数器
 LR_PATIENCE = 3
 LR_FACTOR = 0.5
 LR_MIN = 1e-6
 EPOCHS = 2000
 EARLY_STOPPING_PATIENCE = 20
+EVAL_EVERY = 5                    # 每多少个 epoch 评估并输出一次（中间 epoch 不打印）
 
 RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
@@ -160,6 +168,85 @@ def load_checkpoint(path=CKPT_PATH, retries=5):
             if attempt < retries:
                 time.sleep(1.0 * attempt)
     raise RuntimeError(f"无法读取 checkpoint: {path}")
+
+
+# ==================== 训练过程本地保存（日志 + 指标 CSV）====================
+# 控制台输出同时写入 logs/<tag>_<时间戳>.log
+LOG_DIR = PROJECT_ROOT / "logs"
+METRICS_FIELDS = [
+    'epoch', 'loss', 'fam', 'link', 'rank', 'nce', 'grp',
+    'train_acc', 'val_acc', 'val_gacc', 'train_auc', 'val_auc', 'val_pr_auc',
+    'val_f1_0p5', 'val_thr', 'val_f1_cal', 'val_prec_cal', 'val_rec_cal',
+    'scale', 'fam_gate', 'grp_gate', 'ret_gate', 'bil_gate',
+]
+
+def attach_file_logging(tag):
+    """根 logger 增加文件输出，并新建指标 CSV（含表头）。返回两个路径。"""
+    global _metrics_path
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{tag}_{date_str}.log"
+    handler = logging.FileHandler(log_path, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logging.info(f"训练日志本地保存: {log_path}")
+    return str(log_path)
+
+# ==================== 门控/偏置的可训练性 ====================
+# 这些标量以 0（或极小值）为初值、且是整项先验/交互的乘子，梯度量级与主干不同。
+# 与主干共用 lr=9e-5 时，Adam 在 6×530 步内的最大位移只有约 0.29——
+# 之前诊断出的 family_gate=+0.343、group_gate=-0.315
+# 正好都卡在这个上限，说明它们不是收敛值，而是"能走多远算多远"。
+# 注意 logit_scale 不在此列：它初值已是合理温度，只需微调；若也放大 lr 会一路
+# 冲到 clamp 上限，cosine×30 让 softmax 近似 one-hot、NCE 梯度归零，静默失效。
+CALIB_PARAM_NAMES = ('prior_weight', 'group_prior_weight', 'retrieval_gate',
+                     'bilinear_gate', 'score_bias')
+
+
+def build_optimizer(model, lr, gate_lr, weight_decay):
+    """门控/偏置单独参数组（gate_lr），主干保持 lr。"""
+    gate_params, main_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (gate_params if name in CALIB_PARAM_NAMES else main_params).append(p)
+    optimizer = optim.Adam([
+        {'params': gate_params, 'lr': gate_lr, 'weight_decay': weight_decay},
+        {'params': main_params, 'lr': lr, 'weight_decay': weight_decay},
+    ])
+    logging.info(
+        f"优化器: 门控/偏置 {len(gate_params)} 个参数 @ lr={gate_lr:g}，"
+        f"主干 {len(main_params)} 个 @ lr={lr:g}"
+    )
+    return optimizer, gate_params
+
+
+def calib_snapshot(model):
+    """当前门控/偏置取值，用于日志与 CSV；空串表示该模型没有这一项。"""
+    snap = {
+        'scale': (float(model.logit_scale.detach().clamp(max=math.log(30.0)).exp())
+                  if hasattr(model, 'logit_scale') else ''),
+        'fam_gate': float(model.prior_weight),
+        'grp_gate': (float(model.group_prior_weight)
+                     if getattr(model, 'num_groups', 0) > 0 else 0.0),
+        'ret_gate': float(model.retrieval_gate),
+        'bil_gate': (float(model.bilinear_gate)
+                     if hasattr(model, 'bilinear_gate') else ''),
+    }
+    return snap
+
+
+def format_calib(model):
+    """一行紧凑的标定状态，直接拼进评估日志。"""
+    snap = calib_snapshot(model)
+    parts = []
+    if snap['scale'] != '':
+        parts.append(f"scale {snap['scale']:.2f}")
+    parts.append(f"fam {snap['fam_gate']:+.2f}")
+    parts.append(f"grp {snap['grp_gate']:+.2f}")
+    parts.append(f"ret {snap['ret_gate']:+.2f}")
+    if snap['bil_gate'] != '':
+        parts.append(f"bil {snap['bil_gate']:+.2f}")
+    return ' | '.join(parts)
+
 
 # ==================== 加载数据 ====================
 def load_kinase_family_labels(kinase_nodes, family_file, return_names=False):
@@ -1044,6 +1131,7 @@ def _format_full_rank_short(fr, split_name='val'):
 
 # ==================== 主程序 ====================
 def main():
+    attach_file_logging('train_no_transformer')
     logging.info("实验：无 Transformer + 原始静态 ESM 检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
@@ -1200,9 +1288,11 @@ def main():
     # 6. 损失函数与优化器
     criterion_class = nn.CrossEntropyLoss(ignore_index=-1)
     criterion_link = nn.BCEWithLogitsLoss()   # 配合 interaction_logits，数值上比 BCELoss(sigmoid) 更稳定
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    optimizer, _ = build_optimizer(model, LEARNING_RATE, GATE_LR, 1e-5)
+    # min_lr 按参数组顺序给出：门控组保留下限，避免 LR 衰减后退回"走不动"
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=LR_FACTOR, patience=LR_PATIENCE, min_lr=LR_MIN
+        optimizer, mode='max', factor=LR_FACTOR, patience=LR_PATIENCE,
+        min_lr=[GATE_LR_MIN, LR_MIN]
     )
     
     # 7. 训练循环
@@ -1276,8 +1366,9 @@ def main():
         comp_str = (f"fam {comp['family']:.3f} | link {comp['link']:.3f} | "
                     f"rank {comp['rank']:.3f} | nce {comp['nce']:.3f} | grp {comp['group']:.3f}")
         
-        # 每 5 个 epoch 评估一次（嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）
-        if epoch % 5 == 0:
+        # 每 EVAL_EVERY 个 epoch 评估并输出一次；其余 epoch 不打印，避免刷屏
+        # （嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）
+        if epoch % EVAL_EVERY == 0:
             results = evaluate(
                 model, train_data, kinase_labels, mask_dict, edge_dict,
                 kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
@@ -1286,13 +1377,33 @@ def main():
             )
             val_auc = results['val_auc']
             val_pr_auc = results['val_pr_auc']
+            calib = calib_snapshot(model)
             logging.info(
                 f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}] | "
                 f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f}, Val G-Acc: {results.get('val_group_acc', 0.0):.4f} | "
                 f"Train AUC: {results['train_auc']:.4f}, Val AUC: {val_auc:.4f}, Val PR-AUC: {results['val_pr_auc']:.4f} | "
                 f"Val F1@0.5: {results['val_f1']:.4f} | "
                 f"Val F1*(thr={results['val_thr_cal']:.3f}): {results['val_f1_cal']:.4f}, "
-                f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f}"
+                f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f} | "
+                f"标定: {format_calib(model)}"
+            )
+            record_metrics(
+                epoch=epoch, loss=round(loss, 4),
+                fam=round(comp['family'], 4), link=round(comp['link'], 4),
+                rank=round(comp['rank'], 4), nce=round(comp['nce'], 4),
+                grp=round(comp['group'], 4),
+                train_acc=round(results['train_acc'], 4),
+                val_acc=round(results['val_acc'], 4),
+                val_gacc=round(results.get('val_group_acc', 0.0), 4),
+                train_auc=round(results['train_auc'], 4),
+                val_auc=round(val_auc, 4),
+                val_pr_auc=round(val_pr_auc, 4),
+                val_f1_0p5=round(results['val_f1'], 4),
+                val_thr=round(results['val_thr_cal'], 4),
+                val_f1_cal=round(results['val_f1_cal'], 4),
+                val_prec_cal=round(results['val_precision_cal'], 4),
+                val_rec_cal=round(results['val_recall_cal'], 4),
+                **calib,
             )
 
             # A1: 全候选排序监控（训练期只算 val，按 FULL_RANK_EVERY 降频，避免拖慢训练）
@@ -1316,9 +1427,6 @@ def main():
                     if patience_counter >= EARLY_STOPPING_PATIENCE:
                         logging.info(f"Early stopping at epoch {epoch}")
                         break
-        else:
-            if epoch % 1 == 0:
-                logging.info(f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}]")
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
