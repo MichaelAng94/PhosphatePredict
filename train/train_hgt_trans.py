@@ -956,7 +956,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.45,
+        dropout=0.1,
         motif_len=motif_len,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
@@ -1082,9 +1082,6 @@ def main():
                     if patience_counter >= EARLY_STOPPING_PATIENCE:
                         logging.info(f"Early stopping at epoch {epoch}")
                         break
-        else:
-            if epoch % 1 == 0:
-                logging.info(f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}]")
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
