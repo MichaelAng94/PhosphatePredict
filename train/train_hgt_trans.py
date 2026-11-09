@@ -956,7 +956,7 @@ def main():
         num_heads=4,
         num_hgt_layers=2,
         num_transformer_layers=1,
-        dropout=0.35,
+        dropout=0.45,
         motif_len=motif_len,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
@@ -1071,7 +1071,7 @@ def main():
                 )
                 logging.info(f"  [全候选/val] {format_full_rank_short(fr_val, 'val')}")
 
-            if epoch > 400:
+            if epoch > 300:
                 if val_pr_auc > best_val_auc:
                     best_val_auc = val_pr_auc
                     patience_counter = 0
