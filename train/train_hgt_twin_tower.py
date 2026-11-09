@@ -1468,24 +1468,6 @@ def main():
                 f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f} | "
                 f"标定: {format_calib(model)}"
             )
-            record_metrics(
-                epoch=epoch, loss=round(loss, 4),
-                fam=round(comp['family'], 4), link=round(comp['link'], 4),
-                rank=round(comp['rank'], 4), nce=round(comp['nce'], 4),
-                grp=round(comp['group'], 4),
-                train_acc=round(results['train_acc'], 4),
-                val_acc=round(results['val_acc'], 4),
-                val_gacc=round(results.get('val_group_acc', 0.0), 4),
-                train_auc=round(results['train_auc'], 4),
-                val_auc=round(val_auc, 4),
-                val_pr_auc=round(val_pr_auc, 4),
-                val_f1_0p5=round(results['val_f1'], 4),
-                val_thr=round(results['val_thr_cal'], 4),
-                val_f1_cal=round(results['val_f1_cal'], 4),
-                val_prec_cal=round(results['val_precision_cal'], 4),
-                val_rec_cal=round(results['val_recall_cal'], 4),
-                **calib,
-            )
 
             # A1: 全候选排序监控（训练期只算 val，按 FULL_RANK_EVERY 降频，避免拖慢训练）
             if FULL_RANK_EVAL and FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0:
