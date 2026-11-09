@@ -71,7 +71,7 @@ NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
 STEPS_PER_EPOCH = 6              # A: 每 epoch 采样+梯度更新次数（L1 边丢弃随每次采样刷新，等效步数 ×K）
 # ---- B: 全候选 listwise 排序目标（训练对齐真实应用口径：给定激酶在全部位点中排序）----
-LAMBDA_LIST = 0.3                # B listwise 损失权重；0 关闭
+LAMBDA_LIST = 0.08                # B listwise 损失权重；0 关闭
 LIST_TEMP = 0.5                  # B 温度（logits/τ 后做全候选 softmax；τ 越小越聚焦 top 错误）
 LIST_KINASES = 8                 # B 每步参与全候选 listwise 的激酶数（显存 OOM 时调小）
 FULL_RANK_EVERY = 25             # B 训练期每 N 个 epoch 在 val 上跑一次全候选监控（0=只在结束时算）

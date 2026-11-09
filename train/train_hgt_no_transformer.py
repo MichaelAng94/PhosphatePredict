@@ -177,7 +177,7 @@ METRICS_FIELDS = [
     'epoch', 'loss', 'fam', 'link', 'rank', 'nce', 'grp',
     'train_acc', 'val_acc', 'val_gacc', 'train_auc', 'val_auc', 'val_pr_auc',
     'val_f1_0p5', 'val_thr', 'val_f1_cal', 'val_prec_cal', 'val_rec_cal',
-    'scale', 'fam_gate', 'grp_gate', 'ret_gate', 'bil_gate',
+    'scale', 'fam_gate', 'ret_gate', 'bil_gate',
 ]
 
 def attach_file_logging(tag):
@@ -193,11 +193,12 @@ def attach_file_logging(tag):
 # ==================== 门控/偏置的可训练性 ====================
 # 这些标量以 0（或极小值）为初值、且是整项先验/交互的乘子，梯度量级与主干不同。
 # 与主干共用 lr=9e-5 时，Adam 在 6×530 步内的最大位移只有约 0.29——
-# 之前诊断出的 family_gate=+0.343、group_gate=-0.315
-# 正好都卡在这个上限，说明它们不是收敛值，而是"能走多远算多远"。
+# 之前诊断出的 family_gate=+0.343 正好卡在这个上限，说明它不是收敛值。
+# 大组先验（group_prior_weight）已删除：它与家族先验函数空间重合，
+# 两门控只会沿平坦方向对称漂移，数值不可解释。
 # 注意 logit_scale 不在此列：它初值已是合理温度，只需微调；若也放大 lr 会一路
 # 冲到 clamp 上限，cosine×30 让 softmax 近似 one-hot、NCE 梯度归零，静默失效。
-CALIB_PARAM_NAMES = ('prior_weight', 'group_prior_weight', 'retrieval_gate',
+CALIB_PARAM_NAMES = ('prior_weight', 'retrieval_gate',
                      'bilinear_gate', 'score_bias')
 
 
@@ -225,8 +226,6 @@ def calib_snapshot(model):
         'scale': (float(model.logit_scale.detach().clamp(max=math.log(30.0)).exp())
                   if hasattr(model, 'logit_scale') else ''),
         'fam_gate': float(model.prior_weight),
-        'grp_gate': (float(model.group_prior_weight)
-                     if getattr(model, 'num_groups', 0) > 0 else 0.0),
         'ret_gate': float(model.retrieval_gate),
         'bil_gate': (float(model.bilinear_gate)
                      if hasattr(model, 'bilinear_gate') else ''),
@@ -241,7 +240,6 @@ def format_calib(model):
     if snap['scale'] != '':
         parts.append(f"scale {snap['scale']:.2f}")
     parts.append(f"fam {snap['fam_gate']:+.2f}")
-    parts.append(f"grp {snap['grp_gate']:+.2f}")
     parts.append(f"ret {snap['ret_gate']:+.2f}")
     if snap['bil_gate'] != '':
         parts.append(f"bil {snap['bil_gate']:+.2f}")

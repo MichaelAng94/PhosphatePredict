@@ -209,12 +209,13 @@ class HGTTransformer(nn.Module):
         # prior_weight 为先验融合权重，初始 0 → 训练起点与原模型完全等价，信任程度由梯度自学
         self.family_prototypes = nn.Parameter(torch.randn(num_families, hidden_dim) * 0.02)
         self.prior_weight = nn.Parameter(torch.tensor(0.0))
-        # P2-B2 大组层级原型（同组家族共享质心，统计强度高于逐家族原型）
+        # P2-B2 大组映射：num_groups / family_group_map 保留供大组分类损失与 G-Acc
+        # 评估使用；大组原型先验（group_prototypes/group_prior_weight）已删除——
+        # 它与家族先验同为 fam_probs 的线性偏好再与位点点积，函数空间重合，
+        # 两门控只沿平坦方向对称漂移（+a/-a），数值不可解释
         self.num_groups = num_groups
         if num_groups > 0 and family_group_map is not None:
             self.register_buffer('family_group_map', family_group_map.float())
-            self.group_prototypes = nn.Parameter(torch.randn(num_groups, hidden_dim) * 0.02)
-            self.group_prior_weight = nn.Parameter(torch.tensor(0.0))
 
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(hidden_dim)
@@ -249,10 +250,6 @@ class HGTTransformer(nn.Module):
         pref = fam_probs @ self.family_prototypes                                   # [K, H]
         prior_logits = (pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)  # [B]
         out = main_logits + self.prior_weight * prior_logits
-        if self.num_groups > 0 and hasattr(self, 'group_prototypes'):
-            # P2-B2 大组级先验：大组质心统计更稳，作为家族先验的粗粒度补充
-            g_pref = (fam_probs @ self.family_group_map) @ self.group_prototypes    # [K, H]
-            out = out + self.group_prior_weight * (g_pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)
         # R1: 检索谱先验——ESM 近邻训练激酶的底物谱（log1p 缩放）按位加分，
         # 非参数直通道（无学习自由度，无过拟合面），gate 软开关控制信任度
         if self.retrieval_profile is not None:
