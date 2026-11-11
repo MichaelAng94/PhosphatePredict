@@ -1107,7 +1107,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
                                     kinase_labels=None, family_names=None,
                                     kinase_names=None, max_kinases=0,
                                     site_chunk=FULL_RANK_SITE_CHUNK,
-                                    split_name='test', save_csv=False,
+                                    split_name='test',
                                     out_dir=FULL_RANK_OUT_DIR, date_tag=None,
                                     verbose=True):
     """
@@ -1285,15 +1285,6 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
                 for name, r in worst.iterrows()
             )
         )
-
-        if save_csv:
-            os.makedirs(out_dir, exist_ok=True)
-            p_kin = os.path.join(out_dir, f"{split_name}_per_kinase_{tag}.csv")
-            df.sort_values('full_ap').to_csv(p_kin, index=False, encoding='utf-8-sig')
-            p_fam = os.path.join(out_dir, f"{split_name}_family_{tag}.csv")
-            fam_df.to_csv(p_fam, encoding='utf-8-sig')
-            logging.info(f"[全候选/{split_name}] 明细已保存: {p_kin} | {p_fam}")
-
     return fr
 
 
@@ -1617,7 +1608,7 @@ def main():
                         model, train_data, val_edge_index, num_site,
                         kinase_labels=kinase_labels, family_names=family_names,
                         kinase_names=kinase_names, max_kinases=FULL_RANK_MAX_KINASES,
-                        split_name='val', save_csv=False, verbose=False,
+                        split_name='val', verbose=False,
                     )
                 fr_val = (eval_with_state(model, ema.state_dict(), _full_rank)
                           if ema is not None else _full_rank())
@@ -1713,12 +1704,12 @@ def main():
         fr_val = evaluate_full_candidate_ranking(
             model, train_data, val_edge_index, num_site,
             kinase_labels=kinase_labels, family_names=family_names,
-            kinase_names=kinase_names, split_name='val', save_csv=True,
+            kinase_names=kinase_names, split_name='val'
         )
         fr_test = evaluate_full_candidate_ranking(
             model, train_data, test_edge_index, num_site,
             kinase_labels=kinase_labels, family_names=family_names,
-            kinase_names=kinase_names, split_name='test', save_csv=True,
+            kinase_names=kinase_names, split_name='test'
         )
         logging.info(
             f"全候选汇总: test Macro-AP = {fr_test['macro_ap']:.4f}, "
