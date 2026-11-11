@@ -1354,7 +1354,6 @@ def main():
     # 3. 获取模型输入维度
     esm_dim = data['kinase'].esm_x.size(1)
     n2v_dim = data['kinase'].n2v_x.size(1)
-    site_dim = data['site'].x.size(1)
     
     # 4. 划分数据集（7:2:1）
     # ---- 激酶节点划分（分类任务）----
@@ -1465,6 +1464,10 @@ def main():
     extra_t = torch.tensor(extra, dtype=torch.float32, device=DEVICE)
     for d in (data, train_data):
         d['site'].x = torch.cat([d['site'].x, extra_t], dim=1)
+
+    # 输入维度必须在附加 site_deg / retrieval 统计特征之后读取：
+    # 原始 ESM 1152 维 + 3 维扩展 = 1155，避免 site_proj 维度不匹配
+    site_dim = data['site'].x.size(1)
 
     # 将划分掩码和边索引移到设备
     train_kinase_mask = train_kinase_mask.to(DEVICE)
