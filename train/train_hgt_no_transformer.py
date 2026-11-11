@@ -1629,21 +1629,17 @@ def main():
                           if ema is not None else _full_rank())
                 logging.info(f"  [全候选/val] {_format_full_rank_short(fr_val)}")
 
-            # LR 调度：必须显式 step（之前只创建了 scheduler 从未调用，
-            # 学习率全程固定在 9e-5，模型一直在最优点附近来回跳，是 val 曲线后段
-            # 持续下滑的直接原因之一）
             scheduler.step(pr_sel)
-            if epoch > 300:
-                if pr_sel > best_val_auc:
-                    best_val_auc = pr_sel
-                    patience_counter = 0
-                    save_checkpoint(model, state_dict=ema.state_dict() if ema is not None else None)
-                    logging.info(f"  -> 保存最佳模型 (Val PR-AUC(校准) = {pr_sel:.4f}, 未校准 {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})")
-                else:
-                    patience_counter += 1
-                    if patience_counter >= EARLY_STOPPING_PATIENCE:
-                        logging.info(f"Early stopping at epoch {epoch}")
-                        break
+            if val_pr_auc > best_val_auc:
+                best_val_auc = val_pr_auc
+                patience_counter = 0
+                save_checkpoint(model)
+                logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})")
+            else:
+                patience_counter += 1
+                if patience_counter >= EARLY_STOPPING_PATIENCE:
+                    logging.info(f"Early stopping at epoch {epoch}")
+                    break
     
     # 加载最佳模型并在测试集上评估
     logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
