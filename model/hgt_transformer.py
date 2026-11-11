@@ -204,15 +204,7 @@ class HGTTransformer(nn.Module):
         self.retrieval_gate = nn.Parameter(torch.tensor(0.0))
         self.retrieval_profile = None
 
-        # A1 家族原型先验分支：family_prototypes 第 f 行 = 家族 f 的 motif 偏好向量。
-        # 参数全家族共享（C×H，无逐激酶自由度），结构上无法记忆单个激酶；
-        # prior_weight 为先验融合权重，初始 0 → 训练起点与原模型完全等价，信任程度由梯度自学
-        self.family_prototypes = nn.Parameter(torch.randn(num_families, hidden_dim) * 0.02)
-        self.prior_weight = nn.Parameter(torch.tensor(0.0))
-        # P2-B2 大组映射：num_groups / family_group_map 保留供大组分类损失与 G-Acc
-        # 评估使用；大组原型先验（group_prototypes/group_prior_weight）已删除——
-        # 它与家族先验同为 fam_probs 的线性偏好再与位点点积，函数空间重合，
-        # 两门控只沿平坦方向对称漂移（+a/-a），数值不可解释
+        # P2-B2 大组映射仅用于大组分类损失与 G-Acc 评估
         self.num_groups = num_groups
         if num_groups > 0 and family_group_map is not None:
             self.register_buffer('family_group_map', family_group_map.float())
@@ -231,10 +223,8 @@ class HGTTransformer(nn.Module):
                            k_idx, s_idx, fam_probs=None) -> torch.Tensor:
         """
         返回激酶-位点对的原始打分 [B]（供 BCEWithLogitsLoss 使用）。
-        总分 = 交互 MLP 主分支 + prior_weight · 家族原型先验（A1）：
-        pref = 家族概率 @ 原型矩阵，再与位点嵌入做缩放点积。
-        fam_probs 可传入训练时已算好的 softmax 家族概率 [K, C]（避免重复计算、
-        保证正负样本用同一组概率）；缺省时在内部计算（评估路径）。
+        总分 = 交互 MLP + 双线性分支 + 可选检索谱先验。
+        fam_probs 仅为兼容旧调用保留的可选参数，不再参与计算。
         """
         k_emb = kinase_emb[k_idx]   # [B, H]
         s_emb = site_emb[s_idx]     # [B, H]
@@ -244,12 +234,7 @@ class HGTTransformer(nn.Module):
         bi = (k_emb * (s_emb @ self.bilinear_w.t())).sum(dim=-1) / (k_emb.size(-1) ** 0.5)
         main_logits = main_logits + self.bilinear_gate * bi   # [B]
 
-        # A1 先验分支：家族概率软混合原型偏好，与位点嵌入做缩放点积（/√d 控制量级）
-        if fam_probs is None:
-            fam_probs = torch.softmax(self.predict_family(kinase_emb), dim=-1)  # [K, C]
-        pref = fam_probs @ self.family_prototypes                                   # [K, H]
-        prior_logits = (pref[k_idx] * s_emb).sum(dim=-1) / (s_emb.size(-1) ** 0.5)  # [B]
-        out = main_logits + self.prior_weight * prior_logits
+        out = main_logits
         # R1: 检索谱先验——ESM 近邻训练激酶的底物谱（log1p 缩放）按位加分，
         # 非参数直通道（无学习自由度，无过拟合面），gate 软开关控制信任度
         if self.retrieval_profile is not None:

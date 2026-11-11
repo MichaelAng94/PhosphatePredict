@@ -149,7 +149,7 @@ def main():
     esm_dim, n2v_dim, site_dim, num_families, motif_len, esmc_dim, num_groups = dims
     # hidden_dim 从 checkpoint 自动推断（训练侧可能改动，如 256→128）
     state0 = torch.load(ckpt_paths[0], map_location=DEVICE, weights_only=False)
-    hidden_dim = int(state0['family_prototypes'].shape[1])
+    hidden_dim = int(state0['family_classifier.0.weight'].shape[0])
     del state0
     model = HGTTransformer(
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,

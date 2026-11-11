@@ -80,14 +80,14 @@ class HGTTwinTower(HGTTransformerNoTransformer):
     全部激酶上统一排序，同一激酶也可以在全部位点上统一排序，不需要为每个
     (k, s) 对单独过一遍 MLP —— 这是跨激酶校准与全候选检索的前提。
 
-    三项先验（家族原型 / 大组原型 / 检索谱）与父类保持完全一致的加性校准形式，
+    检索谱先验与父类保持完全一致的加性校准形式，
     gate 仍初始化为 0（训练起点先验不生效，信任度由梯度学习），
     因此本类与基线的差异严格限定为主分数来源。
     """
 
     def __init__(self, *args, emb_dim=128, scale_init=8.0, **kwargs):
         super().__init__(*args, **kwargs)
-        hidden = int(self.family_prototypes.size(1))
+        hidden = int(self.family_classifier[0].out_features)
         d = int(emb_dim) if emb_dim else hidden
         # 两塔不加 dropout：同一步内 interaction_logits 会被调用多次
         #（正样本 / 负样本 / 排序 / InfoNCE），随机 dropout 会让同一次前向的
@@ -111,19 +111,13 @@ class HGTTwinTower(HGTTransformerNoTransformer):
 
     def interaction_logits(self, kinase_emb: torch.Tensor, site_emb: torch.Tensor,
                            k_idx, s_idx, fam_probs=None) -> torch.Tensor:
-        """共享空间余弦打分为主，家族/检索谱先验为加性校准项（大组先验已删除）。"""
+        """共享空间余弦打分为主，检索谱先验为可选加性校准项。"""
         zk, zs = self.project_towers(kinase_emb, site_emb)
         cos = (zk[k_idx] * zs[s_idx]).sum(dim=-1)                     # [B]
         scale = self.logit_scale.clamp(max=math.log(30.0)).exp()
         out = scale * cos + self.score_bias
 
-        # ---- 以下先验项与父类 HGTTransformer.interaction_logits 完全一致 ----
-        if fam_probs is None:
-            fam_probs = torch.softmax(self.predict_family(kinase_emb), dim=-1)
-        s_emb = site_emb[s_idx]                                       # [B, H]
-        d_sqrt = s_emb.size(-1) ** 0.5
-        pref = fam_probs @ self.family_prototypes                      # [K, H]
-        out = out + self.prior_weight * (pref[k_idx] * s_emb).sum(dim=-1) / d_sqrt
+        # fam_probs 仅为兼容旧调用保留，不再参与计算
         if self.retrieval_profile is not None:
             out = out + self.retrieval_gate * self.retrieval_profile[k_idx, s_idx]
         return out
@@ -249,7 +243,7 @@ METRICS_FIELDS = [
     'epoch', 'loss', 'fam', 'link', 'rank', 'nce', 'grp',
     'train_acc', 'val_acc', 'val_gacc', 'train_auc', 'val_auc', 'val_pr_auc',
     'val_f1_0p5', 'val_thr', 'val_f1_cal', 'val_prec_cal', 'val_rec_cal',
-    'scale', 'fam_gate', 'ret_gate', 'bil_gate',
+    'scale', 'ret_gate', 'bil_gate',
 ]
 
 def attach_file_logging(tag):
@@ -266,11 +260,9 @@ def attach_file_logging(tag):
 # 这些标量以 0（或极小值）为初值、且是整项先验/交互的乘子，梯度量级与主干不同。
 # 与主干共用 lr=9e-5 时，Adam 在 6×530 步内的最大位移只有约 0.29——
 # 之前诊断出的 family_gate=+0.343 正好卡在这个上限，说明它不是收敛值。
-# 大组先验（group_prior_weight）已删除：它与家族先验函数空间重合，
-# 两门控只会沿平坦方向对称漂移，数值不可解释。
 # 注意 logit_scale 不在此列：它初值已是合理温度，只需微调；若也放大 lr 会一路
 # 冲到 clamp 上限，cosine×30 让 softmax 近似 one-hot、NCE 梯度归零，静默失效。
-CALIB_PARAM_NAMES = ('prior_weight', 'retrieval_gate',
+CALIB_PARAM_NAMES = ('retrieval_gate',
                      'bilinear_gate', 'score_bias')
 
 
@@ -297,7 +289,6 @@ def calib_snapshot(model):
     snap = {
         'scale': (float(model.logit_scale.detach().clamp(max=math.log(30.0)).exp())
                   if hasattr(model, 'logit_scale') else ''),
-        'fam_gate': float(model.prior_weight),
         'ret_gate': float(model.retrieval_gate),
         'bil_gate': (float(model.bilinear_gate)
                      if hasattr(model, 'bilinear_gate') else ''),
@@ -311,7 +302,6 @@ def format_calib(model):
     parts = []
     if snap['scale'] != '':
         parts.append(f"scale {snap['scale']:.2f}")
-    parts.append(f"fam {snap['fam_gate']:+.2f}")
     parts.append(f"ret {snap['ret_gate']:+.2f}")
     if snap['bil_gate'] != '':
         parts.append(f"bil {snap['bil_gate']:+.2f}")
@@ -718,7 +708,6 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
 
     # 1. 激酶家族分类损失（仅对训练集中的有标签激酶）
     family_logits = model.predict_family(kinase_emb)   # [K, num_families]
-    fam_probs = torch.softmax(family_logits, dim=-1)   # 复用给 A1 家族原型先验分支
     mask = (kinase_labels != -1) & train_kinase_mask
     if mask.sum() > 0:
         loss_family = criterion_class(family_logits[mask], kinase_labels[mask])
@@ -754,8 +743,8 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
             if (~is_tail).any():
                 neg_k[idx[~is_tail]] = torch.randint(
                     0, num_kinase, (int((~is_tail).sum()),), device=neg_k.device)
-    pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s, fam_probs=fam_probs)
-    neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s, fam_probs=fam_probs)
+    pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s)
+    neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s)
     pred = torch.cat([pos_logits, neg_logits], dim=0)
     label = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)]).float()
     loss_link = criterion_link(pred, label)
@@ -779,7 +768,7 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         ki = bk.repeat_interleave(m)
         sj = bs.repeat(m)
         pair_logits = model.interaction_logits(
-            kinase_emb, site_emb, ki, sj, fam_probs=fam_probs
+            kinase_emb, site_emb, ki, sj
         ).view(m, m)
         # 剔除非对角的已知真边（不作为负样本参与分母）
         with torch.no_grad():
@@ -955,7 +944,7 @@ def select_best_f1_threshold(labels, preds):
     
 # ==================== A1 全候选排序评估 ====================
 def _score_kinase_all_sites(model, kinase_emb, site_emb, k_id, num_site,
-                            fam_probs=None, site_chunk=FULL_RANK_SITE_CHUNK):
+                            site_chunk=FULL_RANK_SITE_CHUNK):
     """单个激酶在全部位点上的打分（logit）。logit 与概率严格单调等价，排序指标不变。"""
     device = kinase_emb.device
     out = torch.empty(num_site, dtype=torch.float32, device=device)
@@ -964,7 +953,7 @@ def _score_kinase_all_sites(model, kinase_emb, site_emb, k_id, num_site,
         s_idx = torch.arange(start, end, dtype=torch.long, device=device)
         k_idx = torch.full((end - start,), int(k_id), dtype=torch.long, device=device)
         out[start:end] = model.interaction_logits(
-            kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
+            kinase_emb, site_emb, k_idx, s_idx
         )
     return out
 
@@ -1008,9 +997,6 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
         emb = model(embed_data)
         kinase_emb, site_emb = emb['kinase'], emb['site']
         num_site = min(int(num_site), int(site_emb.size(0)))
-        # 家族概率只算一次，避免每个位点分块重复前向
-        fam_probs = torch.softmax(model.predict_family(kinase_emb), dim=-1)
-
         ek = edge_index[0].detach().cpu().numpy()
         es = edge_index[1].detach().cpu().numpy()
         pos_by_k = defaultdict(set)
@@ -1028,7 +1014,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
         for k_id, site_set in tqdm(items, desc=f'全候选排序[{split_name}]', leave=False):
             scores = _score_kinase_all_sites(
                 model, kinase_emb, site_emb, k_id, num_site,
-                fam_probs=fam_probs, site_chunk=site_chunk
+                site_chunk=site_chunk
             ).cpu().numpy()
             # 一次性排出全部位点名次（1 为最高分）；并列按稳定排序处理
             order = np.argsort(-scores, kind='stable')
@@ -1072,7 +1058,6 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
             pooled_labels.append(label_vec)
             pooled_ranks.append(pos_ranks)
 
-        del fam_probs
 
     if not rows:
         logging.warning(f"[全候选/{split_name}] 该 split 无正边，跳过")

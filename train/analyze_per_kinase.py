@@ -286,7 +286,7 @@ def main():
     train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
     esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
     state = torch.load(args.checkpoint, map_location=DEVICE, weights_only=False)
-    hidden_dim = int(state['family_prototypes'].shape[1])
+    hidden_dim = int(state['family_classifier.0.weight'].shape[0])
     model = HGTTransformer(
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
         num_families=num_families, hidden_dim=hidden_dim, num_heads=4,
