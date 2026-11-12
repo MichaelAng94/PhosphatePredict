@@ -18,13 +18,6 @@ DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超�
   2) A1 全候选排序（FULL_RANK_EVAL）—— 每个激酶在**全部位点**上排序，报告
      Recall@K / Precision@K / Hits@K / MRR / 正例中位秩 / full AP，并按已知底物数
      与家族分层；未标注位点按负例处理，绝对值偏保守，用于衡量真实候选可发现性。
-
-本版针对 PR-AUC 的四项改动（都能在同一份日志里对照观察）：
-  · SCORE_CALIB：池化 PR-AUC 的跨激酶分数校准（kinase_z / kinase_rank），
-    同时输出逐激酶宏 AP，用来区分"口径损失"与"模型能力不足"；
-  · EMA：评估/选点/保存都用权重滑动平均，抑制 ±0.03 级别的选点噪声；
-  · LR 调度真正生效：此前 scheduler 只创建未 step，学习率全程固定 9e-5；
-  · SPLIT_SEED 与 RANDOM_SEED 解耦：换训练种子不再连带换划分，多种子对照才是配对的。
 """
 
 from collections import defaultdict
@@ -128,44 +121,17 @@ LEARNING_RATE = 9e-5
 # Adam 在 lr=9e-5、6 步/epoch 下累计最大位移只有约 0.29，门控会"走不动"，
 # 先验等于从未启用。给它们更高的 lr，才能在训练期内真正被拟合。
 GATE_LR = 5e-4
-GATE_LR_MIN = 5e-5                # 不能与 GATE_LR 相等：否则调度的 min_lr 让门控永不衰减，
-                                  # 主干降到 1e-5 时门控仍有 5e-4（50 倍），后段训练被门控乱走主导
+GATE_LR_MIN = 1e-4
 # LR 调度：连续 LR_PATIENCE 次评估（每次间隔 EVAL_EVERY epoch）Val PR-AUC 不涨则降半档，
 # 下限 LR_MIN；与早停独立，不重置早停计数器
-# 注意：本脚本此前只**创建**了 scheduler 却从未 step，LR 全程固定 9e-5——
-# 模型在谷底来回跳、val 曲线后段单调下滑，就是这个原因。
-# 现在按 20 epoch 一档、最多降 3~4 档的速度衰减，正好在早停窗口（100 epoch）内收敛
-LR_PATIENCE = 4
+LR_PATIENCE = 3
 LR_FACTOR = 0.5
-LR_MIN = 1e-5
+LR_MIN = 1e-6
 EPOCHS = 2000
 EARLY_STOPPING_PATIENCE = 20
 EVAL_EVERY = 5                    # 每多少个 epoch 评估并输出一次（中间 epoch 不打印）
 
-# ---- PR-AUC 口径：跨激酶池化的分数校准 ----
-# PR-AUC 把验证集全部激酶的正负样本放进同一个列表排序。不同激酶的分数存在整体漂移
-# （家族原型先验会给整族位点加同一常数；高置信检索谱又会整体抬高一族激酶），
-# 于是"分数整体偏高的激酶"的 5 倍随机负样本会压过"分数整体偏低的激酶"的正样本，
-# 池化 AP 被系统性低估——但这部分损失与模型排序能力无关，纯属口径问题。
-# 评估协议里每个激酶的正例率都是 1/6，因此池化口径下正确的全局排序是"激酶内分位数"。
-# 校准只做激酶内单调变换，不改变任何单激酶内部排序，故全候选指标(A1)完全不受影响。
-# 默认 kinase_z：既消掉跨激酶的均值/尺度漂移，又保留"分得多开"的置信信息；
-# 合成数据对照显示它在无漂移时也不会变差（kinase_rank 在无漂移时会因丢幅度略降）。
-SCORE_CALIB = 'kinase_z'          # 'none'(旧口径) | 'kinase_z'(推荐) | 'kinase_rank'
-# 最终评估时额外跑"零学习 baseline"（位点流行度 / 检索谱），判断 PR-AUC 还有多少是模型挣来的
-BASELINE_DIAG = True
-
-# ---- 权重滑动平均（EMA）----
-# 同一配置不同 seed 的 test PR-AUC 抖动可达 ±0.03，best-checkpoint 常常选到"运气好的那一个"。
-# EMA 权重是训练轨迹的平均，等价于对参数做时间集成，泛化更稳、选点噪声更小。
-USE_EMA = True
-EMA_DECAY = 0.999                 # 时间常数 ≈ 1/(1-decay) 步；6 步/epoch 时约 167 epoch
-
-RANDOM_SEED = int(os.environ.get('PP_TRAIN_SEED', 42))
-                          # 训练随机性：权重初始化 + 每步采样顺序。
-                          # 多种子对照不必改文件：PP_TRAIN_SEED=1 python3 train/train_hgt_no_transformer.py
-SPLIT_SEED = 42           # 数据划分随机性：固定不动，保证多次运行用的是同一份 val/test，
-                          # 否则"换种子"会连带换掉划分，配对比较失去意义
+RANDOM_SEED = 42
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 
@@ -175,16 +141,14 @@ np.random.seed(RANDOM_SEED)
 date_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
 CKPT_PATH = str(PROJECT_ROOT / "model/best_joint_model_no_transformer_{}.pt".format(date_str))
 
-def save_checkpoint(model=None, path=CKPT_PATH, retries=5, state_dict=None):
+def save_checkpoint(model, path=CKPT_PATH, retries=5):
     """先写 .tmp 再 os.replace 原子替换（避免半写损坏已有最佳模型）；
-    瞬时占用时退避重试；彻底失败不抛异常——训练继续，下个最佳 epoch 会再试。
-    state_dict 非空时保存它（EMA 权重），否则保存 model 当前权重。"""
+    瞬时占用时退避重试；彻底失败不抛异常——训练继续，下个最佳 epoch 会再试。"""
     tmp = path + '.tmp'
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    sd = state_dict if state_dict is not None else model.state_dict()
     for attempt in range(1, retries + 1):
         try:
-            torch.save(sd, tmp)
+            torch.save(model.state_dict(), tmp)
             os.replace(tmp, path)
             return True
         except Exception as e:
@@ -212,12 +176,9 @@ LOG_DIR = PROJECT_ROOT / "logs"
 METRICS_FIELDS = [
     'epoch', 'loss', 'fam', 'link', 'rank', 'nce', 'grp',
     'train_acc', 'val_acc', 'val_gacc', 'train_auc', 'val_auc', 'val_pr_auc',
-    'val_pr_auc_cal', 'val_ap_macro', 'val_auc_cal', 'lr',
     'val_f1_0p5', 'val_thr', 'val_f1_cal', 'val_prec_cal', 'val_rec_cal',
     'scale', 'ret_gate', 'bil_gate',
 ]
-_metrics_path = None   # 指标 CSV 路径（attach_file_logging 里初始化）
-
 
 def attach_file_logging(tag):
     """根 logger 增加文件输出，并新建指标 CSV（含表头）。返回两个路径。"""
@@ -226,7 +187,7 @@ def attach_file_logging(tag):
     log_path = LOG_DIR / f"{tag}_{date_str}.log"
     handler = logging.FileHandler(log_path, encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logging.getLogger().addHandler(handler)   # 缺这行时文件只被创建、内容全丢（曾导致日志 0 字节）
+    logging.getLogger().addHandler(handler)
     logging.info(f"训练日志本地保存: {log_path}")
     return str(log_path)
 
@@ -280,58 +241,6 @@ def format_calib(model):
     if snap['bil_gate'] != '':
         parts.append(f"bil {snap['bil_gate']:+.2f}")
     return ' | '.join(parts)
-
-
-# ==================== 权重滑动平均（EMA）====================
-class ModelEMA:
-    """训练轨迹上的权重指数滑动平均，作为评估/保存的目标权重。
-
-    - 只平均浮点张量（LayerNorm 权重、门控标量都算在内）；整型 buffer 直接覆盖
-    - decay 从 warmup 起逐步逼近目标值：训练早期 EMA 权重与当前权重差很远，
-      直接给 0.999 会让 EMA 长期停在初始化附近
-    - copy_to 用 load_state_dict(strict=True) 换入，模型里非 state_dict 的属性
-      （retrieval_profile 这类非参数张量）不受影响
-    """
-
-    def __init__(self, model, decay, warmup=200):
-        self.decay = decay
-        self.warmup = warmup
-        self.num_updates = 0
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
-
-    def _current_decay(self):
-        # 前期用 (1+n)/(10+n) 快速跟上，累计更新数超过 warmup 后放开到目标 decay
-        if self.num_updates < self.warmup:
-            return min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
-        return self.decay
-
-    @torch.no_grad()
-    def update(self, model):
-        d = self._current_decay()
-        for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point:
-                self.shadow[k].mul_(d).add_(v.detach(), alpha=1.0 - d)
-            else:
-                self.shadow[k] = v.detach().clone()
-        self.num_updates += 1
-
-    @torch.no_grad()
-    def copy_to(self, model):
-        model.load_state_dict(self.shadow, strict=True)
-
-    def state_dict(self):
-        return {k: v.detach().clone() for k, v in self.shadow.items()}
-
-
-def eval_with_state(model, state_dict, fn):
-    """临时换入给定权重执行 fn，结束后无条件换回（避免污染训练中的模型）。"""
-    backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(state_dict, strict=True)
-    try:
-        return fn()
-    finally:
-        model.load_state_dict(backup, strict=True)
-
 
 
 # ==================== 加载数据 ====================
@@ -704,94 +613,6 @@ def build_fixed_eval_pairs(edge_index, num_neg, num_kinase, num_site,
         np.random.set_state(rng_state)
     return pos_k, pos_s, neg_k, neg_s
 
-# ==================== 池化 PR-AUC 的跨激酶校准与分解 ====================
-def _rank01(x):
-    """把一维分数映射到 (0,1) 的均匀分位（平均秩归一化），对并列值用稳定排序。"""
-    n = x.size
-    order = np.argsort(x, kind='mergesort')
-    r = np.empty(n, dtype=np.float64)
-    r[order] = np.arange(n, dtype=np.float64)
-    return (r + 0.5) / n
-
-
-def calibrate_scores_by_kinase(scores, kinase_ids, mode='kinase_rank'):
-    """按激酶做单调变换，使不同激酶的分数在池化排序中相互可比。
-
-    为什么需要：池化 PR-AUC 把全部激酶的正负样本排在同一个列表里。若某激酶对所有
-    位点都给高分（家族先验是大族、检索谱置信高），它的 5 倍随机负样本会挤在列表顶部，
-    把其它激酶的正样本压低——指标掉的是"口径"，不是排序能力。
-    为什么有效：评估协议里每个激酶的正例率恒为 1/6，所以对各激酶先做"内部分位"再池化，
-    才是这个口径下最优的全局排序（等价于按 P(正 | 激酶内相对位置) 排序）。
-    为什么安全：变换在激酶内严格单调，单激酶内部排序（全候选 A1 指标）完全不变。
-    """
-    out = np.empty_like(scores, dtype=np.float64)
-    for k in np.unique(kinase_ids):
-        m = kinase_ids == k
-        s = scores[m]
-        if mode == 'kinase_z':
-            mu = s.mean()
-            sd = s.std()
-            out[m] = (s - mu) / sd if sd > 1e-8 else 0.0
-        elif mode == 'kinase_rank':
-            out[m] = _rank01(s)
-        else:
-            out[m] = s
-    return out
-
-
-def macro_ap_by_kinase(scores, labels, kinase_ids):
-    """逐激酶 AP 的宏平均（每个激酶等权）。
-
-    与池化 AP 对照可以定位问题：宏 AP 明显高于池化 AP ⇒ 差距来自跨激酶分数不可比，
-    用 SCORE_CALIB 就能拿回来；两者接近 ⇒ 分数漂移不是瓶颈，只能靠模型本身改进。
-    """
-    aps = []
-    for k in np.unique(kinase_ids):
-        m = kinase_ids == k
-        y = labels[m]
-        if y.sum() == 0 or y.sum() == len(y):
-            continue
-        aps.append(average_precision_score(y, scores[m]))
-    return float(np.mean(aps)) if aps else 0.0
-
-
-def ap_baselines(pairs, site_train_deg, retrieval_raw=None):
-    """在同一份 1:5 评估样本上，算几个"零学习/弱学习"baseline 的 AP。
-
-    目的是回答"0.61 这个 PR-AUC 到底有多少是模型挣来的"：
-      · site_prior   —— 只看位点在训练图中被多少激酶磷酸化（位点流行度/可磷酸化性）；
-      · retrieval    —— 只用 ESM 近邻检索谱这一条非参数通道；
-      · prior+retriev—— 两者简单相加。
-    若 model AP 只比 site_prior 高一点点，说明这个指标主要在考"哪些位点本身就好磷酸化"，
-    继续在它上面抠 0.02 意义有限；反之说明模型确实在学激酶-位点匹配。
-    返回 {name: {'raw': ap, 'cal': ap}}。
-    """
-    pos_k, pos_s, neg_k, neg_s = pairs
-    ks = torch.cat([pos_k, neg_k])
-    n_pos = pos_k.size(0)
-    label = np.concatenate([np.ones(n_pos), np.zeros(neg_k.size(0))])
-    kid = ks.cpu().numpy()
-    out = {}
-
-    def _score(vals):
-        vals = np.asarray(vals, dtype=np.float64)
-        return {'raw': average_precision_score(label, vals),
-                'cal': average_precision_score(label, calibrate_scores_by_kinase(vals, kid, SCORE_CALIB))}
-
-    deg = np.asarray(site_train_deg, dtype=np.float64)
-    sp = np.log1p(deg)
-    s_site = np.concatenate([sp[pos_s.cpu().numpy()], sp[neg_s.cpu().numpy()]])
-    out['site_prior'] = _score(s_site)
-    if retrieval_raw is not None:
-        r = retrieval_raw
-        s_ret = torch.cat([r[pos_k, pos_s], r[neg_k, neg_s]]).detach().cpu().numpy()
-        out['retrieval'] = _score(s_ret)
-        # 两者量纲差一个数量级，先各自标准化再等权相加，避免权重是随手拍的
-        z = lambda v: (v - v.mean()) / (v.std() + 1e-12)
-        out['prior+retriev'] = _score(z(s_ret) + z(s_site))
-    return out
-
-
 # ==================== 训练和评估函数（支持掩码）====================
 def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
                 optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
@@ -959,8 +780,7 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
         for split, eidx in edge_index_dict.items():
             if eidx.size(1) == 0:
                 for key in ('auc', 'pr_auc', 'f1', 'acc_link', 'precision', 'recall',
-                            'f1_cal', 'thr_cal', 'precision_cal', 'recall_cal',
-                            'pr_auc_cal', 'auc_cal', 'ap_macro', 'ap_z', 'ap_rank'):
+                            'f1_cal', 'thr_cal', 'precision_cal', 'recall_cal'):
                     results[f'{split}_{key}'] = 0.0
                 continue
             if fixed_pairs is not None and split in fixed_pairs:
@@ -976,7 +796,6 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
             neg_pred = model.predict_interaction(kinase_emb, site_emb, neg_k, neg_s)
             pred = torch.cat([pos_pred, neg_pred], dim=0).cpu().numpy()
             label = np.concatenate([np.ones(len(pos_pred)), np.zeros(len(neg_pred))])
-            kinase_ids = np.concatenate([pos_k.cpu().numpy(), neg_k.cpu().numpy()])
             auc = roc_auc_score(label, pred)
             pr_auc = average_precision_score(label, pred)
             pred_labels = (pred >= threshold).astype(int)
@@ -987,22 +806,6 @@ def evaluate(model, embed_data, kinase_labels, mask_dict, edge_index_dict,
             results[f'{split}_acc_link'] = accuracy_score(label, pred_labels)
             results[f'{split}_precision'] = precision_score(label, pred_labels, zero_division=0)
             results[f'{split}_recall'] = recall_score(label, pred_labels, zero_division=0)
-
-            # ---- 池化口径诊断与校准 ----
-            # ap_macro: 逐激酶 AP 等权平均（不受跨激酶分数漂移影响）
-            # pr_auc_cal: 选定的校准口径（SCORE_CALIB）；z / rank 两种都算出来便于对照
-            results[f'{split}_ap_macro'] = macro_ap_by_kinase(pred, label, kinase_ids)
-            ap_z = average_precision_score(
-                label, calibrate_scores_by_kinase(pred, kinase_ids, 'kinase_z'))
-            ap_rank = average_precision_score(
-                label, calibrate_scores_by_kinase(pred, kinase_ids, 'kinase_rank'))
-            results[f'{split}_pr_auc_cal'] = (
-                ap_z if SCORE_CALIB == 'kinase_z'
-                else ap_rank if SCORE_CALIB == 'kinase_rank' else pr_auc)
-            results[f'{split}_ap_z'] = ap_z
-            results[f'{split}_ap_rank'] = ap_rank
-            results[f'{split}_auc_cal'] = roc_auc_score(
-                label, calibrate_scores_by_kinase(pred, kinase_ids, SCORE_CALIB))
 
             # 阈值无关监控口径：NCE/难负样本压缩了 logit 量纲，0.5 不再对应判别边界，
             # 固定阈值下的 F1/Recall 会失真（Prec 高、Rec 塌到 ~0）——排序能力应看 PR-AUC
@@ -1309,14 +1112,8 @@ def _format_full_rank_short(fr, split_name='val'):
 
 # ==================== 主程序 ====================
 def main():
-    attach_file_logging(f'train_no_transformer_s{RANDOM_SEED}')
+    attach_file_logging('train_no_transformer')
     logging.info("实验：无 Transformer + 原始静态 ESM 检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
-    logging.info(
-        f"种子: train={RANDOM_SEED} / split={SPLIT_SEED} | "
-        f"PR-AUC 口径: {SCORE_CALIB} | EMA: {'on' if USE_EMA else 'off'}"
-        f"{f' (decay={EMA_DECAY})' if USE_EMA else ''} | "
-        f"LR: {LEARNING_RATE:g}(plateau {LR_PATIENCE}×{EVAL_EVERY}ep ×{LR_FACTOR}) 门控 {GATE_LR:g}"
-    )
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
     logging.info("加载异构图...")
@@ -1342,10 +1139,10 @@ def main():
     # 只对有标签的节点进行随机划分（不采用分层，避免稀有类别报错）
     labeled_indices = torch.where(kinase_labels != -1)[0].cpu().numpy()
     train_idx, temp_idx = train_test_split(
-        labeled_indices, test_size=0.3, random_state=SPLIT_SEED
+        labeled_indices, test_size=0.3, random_state=RANDOM_SEED
     )
     val_idx, test_idx = train_test_split(
-        temp_idx, test_size=1/3, random_state=SPLIT_SEED
+        temp_idx, test_size=1/3, random_state=RANDOM_SEED
     )
     # 构建掩码（全节点长度）
     train_kinase_mask = torch.zeros(num_kinase, dtype=torch.bool)
@@ -1367,10 +1164,10 @@ def main():
         edge_kinases = full_edge_index[0].cpu().numpy()
         kinases_with_edges = np.unique(edge_kinases)
         train_k, temp_k = train_test_split(
-            kinases_with_edges, test_size=0.3, random_state=SPLIT_SEED
+            kinases_with_edges, test_size=0.3, random_state=RANDOM_SEED
         )
         val_k, test_k = train_test_split(
-            temp_k, test_size=1/3, random_state=SPLIT_SEED
+            temp_k, test_size=1/3, random_state=RANDOM_SEED
         )
         train_edge_index = full_edge_index[:, torch.as_tensor(np.isin(edge_kinases, train_k), device=full_edge_index.device)]
         val_edge_index = full_edge_index[:, torch.as_tensor(np.isin(edge_kinases, val_k), device=full_edge_index.device)]
@@ -1383,10 +1180,10 @@ def main():
         # 旧协议：按边随机划分（transductive，仅用于对照）
         edge_indices = np.arange(full_edge_index.size(1))
         train_edge_idx, temp_edge_idx = train_test_split(
-            edge_indices, test_size=0.3, random_state=SPLIT_SEED
+            edge_indices, test_size=0.3, random_state=RANDOM_SEED
         )
         val_edge_idx, test_edge_idx = train_test_split(
-            temp_edge_idx, test_size=1/3, random_state=SPLIT_SEED
+            temp_edge_idx, test_size=1/3, random_state=RANDOM_SEED
         )
         train_edge_index = full_edge_index[:, train_edge_idx]
         val_edge_index = full_edge_index[:, val_edge_idx]
@@ -1397,7 +1194,7 @@ def main():
     # 冷启动激酶经此从序列相似的训练激酶继承底物特异性
     num_sim_edges = add_esm_knn_edges(data, ESM_KNN_K, ESM_SIM_MIN)
     # P2-B2: 家族→大组层级（KMeans 聚类家族 ESM 质心，适配任意家族命名体系）
-    group_labels, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, SPLIT_SEED)
+    group_labels, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
     group_labels = group_labels.to(DEVICE)
     logging.info(f"P2-B2: {num_families} 个家族聚为 {int(family_group_map.size(1))} 个大组")
 
@@ -1491,9 +1288,7 @@ def main():
         optimizer, mode='max', factor=LR_FACTOR, patience=LR_PATIENCE,
         min_lr=[GATE_LR_MIN, LR_MIN]
     )
-    # EMA：早停/选点都基于 EMA 权重，checkpoint 保存的也是 EMA 权重
-    ema = ModelEMA(model, EMA_DECAY) if USE_EMA else None
-
+    
     # 7. 训练循环
     best_val_auc = 0.0
     patience_counter = 0
@@ -1546,7 +1341,7 @@ def main():
         fixed_eval_pairs[split] = build_fixed_eval_pairs(
             edge_dict[split], num_neg=5, num_kinase=num_kinase, num_site=num_site,
             kinase_sites=kinase_sites, site_kinases=site_kinases,
-            strategy=NEG_STRATEGY, seed=SPLIT_SEED + 1000 + i,
+            strategy=NEG_STRATEGY, seed=RANDOM_SEED + 1000 + i,
         )
     
     # logging.info("start training...")
@@ -1559,8 +1354,6 @@ def main():
                 optimizer, criterion_class, criterion_link, kinase_sites, site_kinases,
                 hard_ctx=hard_ctx, edge_weights=train_edge_weights
             )
-            if ema is not None:
-                ema.update(model)   # 每个优化步更新一次，decay 的时间常数按步计
             for k, v in parts.items():
                 comp[k] = comp.get(k, 0.0) + v / STEPS_PER_EPOCH
         loss = sum(comp.values())
@@ -1570,51 +1363,26 @@ def main():
         # 每 EVAL_EVERY 个 epoch 评估并输出一次；其余 epoch 不打印，避免刷屏
         # （嵌入由仅含训练边的 train_data 计算，避免评估边泄漏）
         if epoch % EVAL_EVERY == 0:
-            def _eval_once():
-                r = evaluate(
-                    model, train_data, kinase_labels, mask_dict, edge_dict,
-                    kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
-                    fixed_pairs=fixed_eval_pairs, group_labels=group_labels,
-                )
-                return r, format_calib(model), calib_snapshot(model)
-
-            # 评估/选点统一用 EMA 权重（存在时）：单点权重噪声大，best-checkpoint 容易选到
-            # "运气好的那一轮"；EMA 是轨迹平均，选点更稳
-            if ema is not None:
-                results, calib_str, calib_snap = eval_with_state(model, ema.state_dict(), _eval_once)
-            else:
-                results, calib_str, calib_snap = _eval_once()
-
+            results = evaluate(
+                model, train_data, kinase_labels, mask_dict, edge_dict,
+                kinase_sites, site_kinases, num_neg_eval=5, neg_strategy=NEG_STRATEGY,
+                fixed_pairs=fixed_eval_pairs,
+                group_labels=group_labels
+            )
             val_auc = results['val_auc']
             val_pr_auc = results['val_pr_auc']
-            # 选点口径：默认用跨激酶校准后的池化 PR-AUC（见 SCORE_CALIB 说明）
-            pr_sel = results['val_pr_auc_cal'] if SCORE_CALIB != 'none' else val_pr_auc
+            calib = calib_snapshot(model)
             logging.info(
                 f"Epoch {epoch:03d} | Loss: {loss:.4f} [{comp_str}] | "
                 f"Train Acc: {results['train_acc']:.4f}, Val Acc: {results['val_acc']:.4f}, Val G-Acc: {results.get('val_group_acc', 0.0):.4f} | "
-                f"Train AUC: {results['train_auc']:.4f}, Val AUC: {val_auc:.4f}, Val PR-AUC: {val_pr_auc:.4f} | "
-                f"Val PR-AUC(校准): {results['val_pr_auc_cal']:.4f} (宏AP {results['val_ap_macro']:.4f}, "
-                f"校准增益 {results['val_pr_auc_cal'] - val_pr_auc:+.4f}) | "
+                f"Train AUC: {results['train_auc']:.4f}, Val AUC: {val_auc:.4f}, Val PR-AUC: {results['val_pr_auc']:.4f} | "
                 f"Val F1@0.5: {results['val_f1']:.4f} | "
                 f"Val F1*(thr={results['val_thr_cal']:.3f}): {results['val_f1_cal']:.4f}, "
                 f"Prec*: {results['val_precision_cal']:.4f}, Rec*: {results['val_recall_cal']:.4f} | "
-                f"标定: {calib_str} | LR: {optimizer.param_groups[1]['lr']:.2e}"
+                f"标定: {format_calib(model)}"
             )
 
-            # A1: 全候选排序监控（训练期只算 val，按 FULL_RANK_EVERY 降频，避免拖慢训练）
-            if FULL_RANK_EVAL and FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0:
-                def _full_rank():
-                    return evaluate_full_candidate_ranking(
-                        model, train_data, val_edge_index, num_site,
-                        kinase_labels=kinase_labels, family_names=family_names,
-                        kinase_names=kinase_names, max_kinases=FULL_RANK_MAX_KINASES,
-                        split_name='val', verbose=False,
-                    )
-                fr_val = (eval_with_state(model, ema.state_dict(), _full_rank)
-                          if ema is not None else _full_rank())
-                logging.info(f"  [全候选/val] {_format_full_rank_short(fr_val)}")
-
-            scheduler.step(pr_sel)
+            # scheduler.step(pr_sel)
             if val_pr_auc > best_val_auc:
                 best_val_auc = val_pr_auc
                 patience_counter = 0
@@ -1651,41 +1419,6 @@ def main():
         f"Precision = {final_results['test_precision']:.4f}, "
         f"Recall = {final_results['test_recall']:.4f}"
     )
-    logging.info(
-        f"口径对照: test PR-AUC(未校准 1:5 旧口径) = {final_results['test_pr_auc']:.4f} | "
-        f"激酶内 z 校准 = {final_results['test_ap_z']:.4f} | "
-        f"激酶内分位校准 = {final_results['test_ap_rank']:.4f} | "
-        f"逐激酶宏AP = {final_results['test_ap_macro']:.4f}"
-    )
-    logging.info(
-        f"AUC 对照: 未校准 {final_results['test_auc']:.4f} / 校准 {final_results['test_auc_cal']:.4f}"
-        f"（SCORE_CALIB={SCORE_CALIB}；校准只改跨激酶可比性，不改任何单激酶内部排序）"
-    )
-    logging.info(
-        "口径解读: 宏AP ≈ 校准后池化AP ≫ 未校准池化AP ⇒ 差距来自跨激酶分数不可比（口径问题，已可由 SCORE_CALIB 收回）；"
-        "三者接近且都停留在 0.6 附近 ⇒ 分数漂移不是瓶颈，只能靠模型本身的排序能力"
-    )
-
-    # ---- 零学习 baseline：判断 PR-AUC 里有多少只是"位点流行度" ----
-    if BASELINE_DIAG:
-        site_train_deg = np.bincount(
-            train_edge_index[1].cpu().numpy(), minlength=num_site)
-        logging.info(
-            "==== AP baseline（复用同一份 1:5 固定样本；未校准/已校准）===="
-        )
-        for split in ('val', 'test'):
-            bl = ap_baselines(fixed_eval_pairs[split], site_train_deg, retrieval_raw)
-            seg = " | ".join(
-                f"{name} {v['raw']:.4f}/{v['cal']:.4f}" for name, v in bl.items()
-            )
-            logging.info(
-                f"[{split}] 模型 {final_results[f'{split}_pr_auc']:.4f}/"
-                f"{final_results[f'{split}_pr_auc_cal']:.4f}  vs  {seg}"
-            )
-        logging.info(
-            "解读: 若「模型」只比 site_prior 高 0.02~0.05，说明该指标主要在考位点本身是否易磷酸化，"
-            "继续抠它的收益有限；此时应转向全候选排序（Recall@K/MRR）这类真正考激酶特异性的口径。"
-        )
     logging.info(
         f"参考上界: test 自身最优阈值 F1 = {final_results['test_f1_cal']:.4f} @ {final_results['test_thr_cal']:.4f}"
         f"（阈值已接触测试数据，仅用于诊断阈值漂移，不作为正式指标）"
