@@ -345,10 +345,12 @@ def load_kinase_family_labels(kinase_nodes, family_file, return_names=False):
         return labels, num_classes, [str(c) for c in le.classes_]
     return labels, num_classes
 
-def add_esm_knn_edges(data, k=10, sim_min=0.75):
+def add_esm_knn_edges(data, k=10, sim_min=0.75, train_kinase_mask=None):
     """P2-B1（精细化）: 每个激酶取 ESM 余弦 top-k 候选，仅保留 sim>=sim_min 的连边
     （自适应度数：近亲多的激酶多连、无近亲的激酶不连噪声边），对称化去重。
-    仅用序列特征、无任何标注泄漏。k<=0 时写入空边集保持图结构与 metadata 一致。返回边数。"""
+    仅用序列特征、无任何标注泄漏。k<=0 时写入空边集保持图结构与 metadata 一致。返回边数。
+    train_kinase_mask [n] 可选：非训练激酶只能从训练激酶中选择相似边来源，
+    训练激酶的候选范围保持不变；被屏蔽候选也不会用于保底连接。"""
     esm = data['kinase'].esm_x
     n = esm.size(0)
     if k <= 0 or n <= 1:
@@ -357,6 +359,18 @@ def add_esm_knn_edges(data, k=10, sim_min=0.75):
     esm_n = torch.nn.functional.normalize(esm, dim=-1)
     sim = esm_n @ esm_n.t()
     sim.fill_diagonal_(-1.0)
+    candidate_valid = torch.ones(n, n, dtype=torch.bool, device=esm.device)
+    candidate_valid.fill_diagonal_(False)
+    if train_kinase_mask is not None:
+        train_kinase_mask = train_kinase_mask.to(device=esm.device, dtype=torch.bool)
+        if train_kinase_mask.numel() != n:
+            raise ValueError(f'train_kinase_mask 长度应为 {n}，实际为 {train_kinase_mask.numel()}')
+        # 仅限制非训练目标 -> 非训练来源；训练目标的候选范围不变
+        blocked = (~train_kinase_mask).unsqueeze(1) & (~train_kinase_mask).unsqueeze(0)
+        candidate_valid &= ~blocked
+        sim = sim.masked_fill(blocked, -1.0)
+        logging.info(f"P2-B1: {int((~train_kinase_mask).sum())} 个非训练激酶的相似边检索源 "
+                     f"已限制为 {int(train_kinase_mask.sum())} 个训练激酶")
     k_eff = min(k, n - 1)
     topv, topi = sim.topk(k_eff, dim=-1)          # 候选相似度 + 索引
     # B1 数据质量诊断：近零范数 ESM 向量（疑似缺失嵌入零填充）无法产生有意义的相似边
@@ -365,14 +379,15 @@ def add_esm_knn_edges(data, k=10, sim_min=0.75):
     if bad:
         logging.warning(f"P2-B1: {bad} 个激酶 ESM 向量范数近零（疑似缺失嵌入零填充），"
                         f"其相似边与输入特征均不可靠，请检查上游 ESM 数据")
-    keep = topv >= sim_min
+    valid = candidate_valid.gather(1, topi)
+    keep = (topv >= sim_min) & valid
     # B1 保底邻居：无邻居激酶强制连 top-ESM_FALLBACK_K 个候选（topv 已按相似度降序），
     # sim_min 只负责截断邻居过多的激酶——保证每个冷启动激酶都有近亲可继承底物特异性
     deg = keep.sum(dim=1)
     iso_mask = deg < ESM_FALLBACK_K
     if iso_mask.any():
         fb_cols = torch.arange(k_eff, device=esm.device).unsqueeze(0) < ESM_FALLBACK_K
-        keep = keep | (iso_mask.unsqueeze(1) & fb_cols)
+        keep = keep | (iso_mask.unsqueeze(1) & fb_cols & valid)
         logging.info(f"P2-B1: {int(iso_mask.sum())} 个激酶低于阈值无相似边，"
                      f"已强制连 top-{ESM_FALLBACK_K} 保底邻居（其 top1 相似度 median="
                      f"{topv[iso_mask, 0].median():.3f}，过低则说明 ESM 嵌入本身可疑）")
@@ -1271,7 +1286,12 @@ def main():
     
     # P2-B1: ESM-kNN 相似激酶边（仅用序列特征，无标注泄漏），必须在 clone 前加到 data：
     # 冷启动激酶经此从序列相似的训练激酶继承底物特异性
-    num_sim_edges = add_esm_knn_edges(data, ESM_KNN_K, ESM_SIM_MIN)
+    # 与链接预测训练边严格对齐：val/test 激酶只能从训练激酶检索相似边
+    link_train_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=full_edge_index.device)
+    link_train_kmask[train_edge_index[0]] = True
+    num_sim_edges = add_esm_knn_edges(
+        data, ESM_KNN_K, ESM_SIM_MIN, train_kinase_mask=link_train_kmask
+    )
     # P2-B2: 家族→大组层级（KMeans 聚类家族 ESM 质心，适配任意家族命名体系）
     group_labels, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
     group_labels = group_labels.to(DEVICE)

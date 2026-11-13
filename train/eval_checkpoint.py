@@ -47,8 +47,7 @@ def build_protocol():
     num_kinase = len(kinase_names)
     num_site = data['site'].x.size(0)
     kinase_labels, num_families = load_kinase_family_labels(kinase_names, KINASE_FAMILY_FILE)
-    # P2: 与训练脚本一致地加 ESM-kNN 相似边与家族大组（必须在 clone 前作用于 data）
-    add_esm_knn_edges(data, ESM_KNN_K, ESM_SIM_MIN)
+    # 家族大组与相似边都必须在 clone 前作用于 data；相似边在下方划分后按训练掩码添加
     _, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
 
     full_edge_index = data['kinase', 'phosphorylates', 'site'].edge_index
@@ -73,6 +72,10 @@ def build_protocol():
     # R1: 与训练脚本一致地构建检索谱先验（只用训练激酶/训练边，零泄漏）；
     # R1.1 置信度调制参数必须与训练一致，否则注入的谱与训练期不同，指标不可比
     train_kinase_mask = torch.as_tensor(np.isin(kinase_names, train_k))
+    add_esm_knn_edges(
+        data, ESM_KNN_K, ESM_SIM_MIN,
+        train_kinase_mask=train_kinase_mask.to(full_edge_index.device),
+    )
     retrieval_log, _, _ = build_retrieval_profile(
         data['kinase'].esm_x, train_kinase_mask.to(DEVICE), train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
