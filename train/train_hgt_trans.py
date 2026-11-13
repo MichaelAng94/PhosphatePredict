@@ -99,6 +99,7 @@ RETRIEVAL_NEG_MAX = 0.15          # 负样本反污染阈值：raw 谱值超此�
 # （ESM 相似 ≠ 底物相似——孤立/非典型激酶的错误先验比无先验更糟，如 TAF1/RON）
 RETRIEVAL_CONF_CENTER = 0.85      # 置信度中心（top1 相似度等于此值时 conf=0.5）
 RETRIEVAL_CONF_TEMP = 0.04        # 置信度温度（越小开关越陡）
+PPI_RETRIEVAL_SIM = 0.9           # PPI 邻居（训练激酶侧）注入检索池的相似度，与 ESM 近邻统一 top-m 竞争；0=关闭
 LEARNING_RATE = 9e-5
 # LR 调度：连续 LR_PATIENCE 次评估（每次间隔 5 epoch）Val PR-AUC 不涨则降半档，
 # 下限 LR_MIN；与早停独立，不重置早停计数器
@@ -321,11 +322,17 @@ def _generate_negatives(pos_k, pos_s, num_kinase, num_site,
 
 def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
                             top_m=20, tau=0.05, scale=10.0,
-                            conf_center=0.85, conf_temp=0.04):
+                            conf_center=0.85, conf_temp=0.04,
+                            ppi_edge_index=None, ppi_sim=0.9):
     """R1: 检索式底物谱先验——对每个激酶 k，按 ESM 余弦相似度检索 top_m 个
     **训练激酶**，softmax(sim/tau) 加权累加它们的训练底物指示向量，得到 k 的
     近邻底物谱 profile[k, s]。谱经 log1p(profile*scale) 压缩量级后作为非参数
     先验注入解码器（retrieval_gate 软开关控制信任度）。
+
+    PPI 邻居扩展：物理互作激酶（复合体/级联成员）共享底物空间，是独立于序列
+    相似度的信号——PPI 邻居（仅训练激酶侧）以固定相似度 ppi_sim 注入检索池，
+    与 ESM 近邻统一竞争 top_m 席位（原 ESM 相似度更高则保留原值）。
+    ppi_sim=0 或 ppi_edge_index=None 时关闭，行为回退纯 ESM 检索。
 
     R1.1 置信度调制：谱再逐激酶乘 conf_k = sigmoid((top1_sim_k - conf_center)/conf_temp)
     后注入——与最近训练激酶序列相似度高的激酶（近亲明确，如 P38D/AURC）完全信任谱；
@@ -351,8 +358,28 @@ def build_retrieval_profile(esm, train_kinase_mask, train_edge_index, num_site,
     sim = esm_n @ esm_n.t()                       # [K, K]
     sim[:, ~train_kinase_mask] = -1.0             # 只检索训练激酶（冷启动激酶不作检索源）
     sim.fill_diagonal_(-1.0)                      # 不检索自己
+    # PPI 邻居扩展：把训练激酶侧的 PPI 邻居相似度抬到 ppi_sim，与 ESM 近邻统一竞争 top_m
+    ppi_mask = None
+    if ppi_edge_index is not None and ppi_sim and ppi_edge_index.numel() > 0:
+        import logging as _logging
+        src = ppi_edge_index[0].to(device)
+        dst = ppi_edge_index[1].to(device)
+        # 邻居侧必须是训练激酶（谱才非零）；排除自环（自谱对非训练激酶是纯稀释）
+        keep = train_kinase_mask[dst] & (src != dst)
+        src, dst = src[keep], dst[keep]
+        lifted = sim[src, dst] < ppi_sim         # 原相似度更高则不动（max 语义）
+        sim[src[lifted], dst[lifted]] = ppi_sim
+        ppi_mask = torch.zeros(K, K, dtype=torch.bool, device=device)
+        ppi_mask[src, dst] = True
     topv, topi = sim.topk(m, dim=-1)              # [K, m]
     w = torch.softmax(topv / tau, dim=-1)         # [K, m]
+    if ppi_mask is not None:
+        # 诊断：PPI 注入实际改变检索结果的幅度（进了多少 top_m 席位）
+        in_top = ppi_mask[torch.arange(K, device=device).unsqueeze(1), topi]   # [K, m]
+        _logging.info(
+            f"R1-PPI: 训练侧 PPI 邻居 {int(ppi_mask.sum())} 条，其中 "
+            f"{int(in_top.sum())} 席进入 top{m}（覆盖 {int(in_top.any(dim=1).sum())} 个激酶的检索池）"
+        )
 
     # 训练底物指示矩阵 A[k, s] = 1 表示训练边 (k→s)
     A = torch.zeros(K, num_site, device=device)
@@ -920,6 +947,8 @@ def main():
         data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
         conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
+        ppi_edge_index=data['kinase', 'ppis', 'kinase'].edge_index,
+        ppi_sim=PPI_RETRIEVAL_SIM,
     )
     covered = (retrieval_raw.max(dim=1).values > 0).float().mean().item()
     low_conf = (retrieval_conf < 0.25).float().mean().item()

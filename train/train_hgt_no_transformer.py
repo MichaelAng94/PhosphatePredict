@@ -85,6 +85,15 @@ EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的�
 # ---- P1 排序目标改造 ----
 HARD_NEG_PROBS = (0.4, 0.3, 0.3)  # 训练负样本策略混合比例: (随机tail, 同家族激酶head, 同蛋白位点tail)
 DEGREE_ALPHA = 0.5              # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
+# ---- 分层冷启动采样（训练侧）：稀有家族模式强化 ----
+# 直觉：holdout 激酶的冷启动预测靠"同家族训练成员"继承家族级模式（原型/检索谱/基序偏好），
+# 独苗或稀有家族（训练成员 1~3 个）的家族模式在共享参数里梯度信号稀薄 → 其同家族
+# holdout 成员迁移失败。按家族在训练集中的有效成员数分层加权，强化稀有家族模式；
+# 只动训练采样分布，划分协议/评估完全不变，历史指标可比。
+STRATIFIED_COLD_START = True
+FAMILY_RARITY_TIERS = (1, 3, 9)    # 家族训练成员数分界：1(独苗) / 2-3 / 4-9 / >=10 四档
+FAMILY_RARITY_WEIGHTS = (3.0, 2.0, 1.5, 1.0)   # 各档采样倍数
+ORPHAN_WEIGHT = 1.5                # 无家族标签训练激酶的倍数（中等强化，其模式无显式家族通道）
 LAMBDA_NCE = 0.4                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
@@ -1316,6 +1325,38 @@ def main():
     _ek = train_edge_index[0].cpu().numpy()
     train_deg = np.bincount(_ek, minlength=num_kinase).astype(np.float64)
     _w = 1.0 / np.maximum(train_deg[_ek], 1.0) ** DEGREE_ALPHA
+    # 分层冷启动采样：再乘家族稀有度分层倍数——独苗/稀有家族的训练边过采样，
+    # 让其家族级模式（原型/检索谱）获得足够梯度，同家族 holdout 激酶才有东西可继承
+    if STRATIFIED_COLD_START:
+        train_k_set = np.unique(_ek)
+        # 家族在"链接训练激酶"中的有效成员数（val/test 同家族成员不算继承来源）
+        fam_train_count = np.zeros(int(num_families), dtype=np.int64)
+        for _k in train_k_set:
+            _lab = int(kinase_family_np[_k])
+            if _lab != -1:
+                fam_train_count[_lab] += 1
+        tier_w = np.ones(num_kinase, dtype=np.float64)
+        tier_tag = np.full(num_kinase, -1, dtype=np.int8)
+        for _k in train_k_set:
+            _lab = int(kinase_family_np[_k])
+            if _lab == -1:
+                tier_w[_k] = ORPHAN_WEIGHT
+            else:
+                _n = fam_train_count[_lab]
+                _tier = 0 if _n <= FAMILY_RARITY_TIERS[0] else \
+                        1 if _n <= FAMILY_RARITY_TIERS[1] else \
+                        2 if _n <= FAMILY_RARITY_TIERS[2] else 3
+                tier_w[_k] = FAMILY_RARITY_WEIGHTS[_tier]
+                tier_tag[_k] = _tier
+        # 分层统计：每档的训练边占比（诊断强化是否真的给了小众家族）
+        _stat = []
+        for _tier, _mult in enumerate(FAMILY_RARITY_WEIGHTS):
+            _mask = tier_tag[_ek] == _tier
+            _stat.append(f"档{_tier + 1}(x{_mult:g}) {int(_mask.sum())} 边 {_mask.mean() * 100:.1f}%")
+        _orph = np.isin(_ek, np.where(tier_tag == -1)[0])
+        _stat.append(f"无标签(x{ORPHAN_WEIGHT:g}) {int(_orph.sum())} 边 {_orph.mean() * 100:.1f}%")
+        logging.info("分层冷启动采样: " + " | ".join(_stat))
+        _w = _w * tier_w[_ek]
     train_edge_weights = _w / _w.sum()
     hard_ctx = {
         'kinase_family': kinase_family_np,

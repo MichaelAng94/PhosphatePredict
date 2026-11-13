@@ -35,6 +35,7 @@ from train_hgt_trans import (
     load_kinase_family_labels, build_true_edge_maps, build_fixed_eval_pairs,
     select_best_f1_threshold, add_esm_knn_edges, build_family_groups,
     build_retrieval_profile,
+    PPI_RETRIEVAL_SIM,
 )
 from model.hgt_transformer import HGTTransformer
 
@@ -76,6 +77,8 @@ def build_protocol():
         data['kinase'].esm_x, train_kinase_mask.to(DEVICE), train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
         conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
+        ppi_edge_index=data['kinase', 'ppis', 'kinase'].edge_index,
+        ppi_sim=PPI_RETRIEVAL_SIM,
     )
 
     # 嵌入只由训练边快照计算（与训练期评估一致，避免评估边泄漏）
