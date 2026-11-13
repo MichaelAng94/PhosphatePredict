@@ -85,15 +85,6 @@ EDGE_DROP_RATIO = 0.3             # L1 冷启动模拟：每轮随机屏蔽的�
 # ---- P1 排序目标改造 ----
 HARD_NEG_PROBS = (0.4, 0.3, 0.3)  # 训练负样本策略混合比例: (随机tail, 同家族激酶head, 同蛋白位点tail)
 DEGREE_ALPHA = 0.5              # 激酶均衡采样: 正边采样权重 ∝ 1/deg(kinase)^alpha（0=旧均匀采样, 1=完全均衡）
-# ---- 分层冷启动采样（训练侧）：稀有家族模式强化 ----
-# 直觉：holdout 激酶的冷启动预测靠"同家族训练成员"继承家族级模式（原型/检索谱/基序偏好），
-# 独苗或稀有家族（训练成员 1~3 个）的家族模式在共享参数里梯度信号稀薄 → 其同家族
-# holdout 成员迁移失败。按家族在训练集中的有效成员数分层加权，强化稀有家族模式；
-# 只动训练采样分布，划分协议/评估完全不变，历史指标可比。
-STRATIFIED_COLD_START = True
-FAMILY_RARITY_TIERS = (1, 3, 9)    # 家族训练成员数分界：1(独苗) / 2-3 / 4-9 / >=10 四档
-FAMILY_RARITY_WEIGHTS = (3.0, 2.0, 1.5, 1.0)   # 各档采样倍数
-ORPHAN_WEIGHT = 1.5                # 无家族标签训练激酶的倍数（中等强化，其模式无显式家族通道）
 LAMBDA_NCE = 0.4                  # L4 批内对比损失权重（InfoNCE，直接优化排序）
 NCE_TEMP = 0.2                    # L4 温度
 NCE_BATCH = 256                   # L4 子批大小（B×B 交叉打分，OOM 时调小）
@@ -186,7 +177,7 @@ METRICS_FIELDS = [
     'epoch', 'loss', 'fam', 'link', 'rank', 'nce', 'grp',
     'train_acc', 'val_acc', 'val_gacc', 'train_auc', 'val_auc', 'val_pr_auc',
     'val_f1_0p5', 'val_thr', 'val_f1_cal', 'val_prec_cal', 'val_rec_cal',
-    'scale', 'ret_gate', 'bil_gate',
+    'scale', 'fam_gate', 'ret_gate', 'bil_gate',
 ]
 
 def attach_file_logging(tag):
@@ -204,9 +195,11 @@ def attach_file_logging(tag):
 # 这些标量以 0（或极小值）为初值、且是整项先验/交互的乘子，梯度量级与主干不同。
 # 与主干共用 lr=9e-5 时，Adam 在 6×530 步内的最大位移只有约 0.29——
 # 之前诊断出的 family_gate=+0.343 正好卡在这个上限，说明它不是收敛值。
+# 大组先验（group_prior_weight）已删除：它与家族先验函数空间重合，
+# 两门控只会沿平坦方向对称漂移，数值不可解释。
 # 注意 logit_scale 不在此列：它初值已是合理温度，只需微调；若也放大 lr 会一路
 # 冲到 clamp 上限，cosine×30 让 softmax 近似 one-hot、NCE 梯度归零，静默失效。
-CALIB_PARAM_NAMES = ('retrieval_gate',
+CALIB_PARAM_NAMES = ('prior_weight', 'retrieval_gate',
                      'bilinear_gate', 'score_bias')
 
 
@@ -233,6 +226,7 @@ def calib_snapshot(model):
     snap = {
         'scale': (float(model.logit_scale.detach().clamp(max=math.log(30.0)).exp())
                   if hasattr(model, 'logit_scale') else ''),
+        # 'fam_gate': float(model.prior_weight),
         'ret_gate': float(model.retrieval_gate),
         'bil_gate': (float(model.bilinear_gate)
                      if hasattr(model, 'bilinear_gate') else ''),
@@ -246,6 +240,7 @@ def format_calib(model):
     parts = []
     if snap['scale'] != '':
         parts.append(f"scale {snap['scale']:.2f}")
+    # parts.append(f"fam {snap['fam_gate']:+.2f}")
     parts.append(f"ret {snap['ret_gate']:+.2f}")
     if snap['bil_gate'] != '':
         parts.append(f"bil {snap['bil_gate']:+.2f}")
@@ -289,12 +284,10 @@ def load_kinase_family_labels(kinase_nodes, family_file, return_names=False):
         return labels, num_classes, [str(c) for c in le.classes_]
     return labels, num_classes
 
-def add_esm_knn_edges(data, k=10, sim_min=0.75, train_kinase_mask=None):
+def add_esm_knn_edges(data, k=10, sim_min=0.75):
     """P2-B1（精细化）: 每个激酶取 ESM 余弦 top-k 候选，仅保留 sim>=sim_min 的连边
     （自适应度数：近亲多的激酶多连、无近亲的激酶不连噪声边），对称化去重。
-    仅用序列特征、无任何标注泄漏。k<=0 时写入空边集保持图结构与 metadata 一致。返回边数。
-    train_kinase_mask [n] 可选：非训练激酶只能从训练激酶中选择相似边来源，
-    训练激酶的候选范围保持不变；被屏蔽候选也不会用于保底连接。"""
+    仅用序列特征、无任何标注泄漏。k<=0 时写入空边集保持图结构与 metadata 一致。返回边数。"""
     esm = data['kinase'].esm_x
     n = esm.size(0)
     if k <= 0 or n <= 1:
@@ -303,18 +296,6 @@ def add_esm_knn_edges(data, k=10, sim_min=0.75, train_kinase_mask=None):
     esm_n = torch.nn.functional.normalize(esm, dim=-1)
     sim = esm_n @ esm_n.t()
     sim.fill_diagonal_(-1.0)
-    candidate_valid = torch.ones(n, n, dtype=torch.bool, device=esm.device)
-    candidate_valid.fill_diagonal_(False)
-    if train_kinase_mask is not None:
-        train_kinase_mask = train_kinase_mask.to(device=esm.device, dtype=torch.bool)
-        if train_kinase_mask.numel() != n:
-            raise ValueError(f'train_kinase_mask 长度应为 {n}，实际为 {train_kinase_mask.numel()}')
-        # 仅限制非训练目标 -> 非训练来源；训练目标的候选范围不变
-        blocked = (~train_kinase_mask).unsqueeze(1) & (~train_kinase_mask).unsqueeze(0)
-        candidate_valid &= ~blocked
-        sim = sim.masked_fill(blocked, -1.0)
-        logging.info(f"P2-B1: {int((~train_kinase_mask).sum())} 个非训练激酶的相似边检索源 "
-                     f"已限制为 {int(train_kinase_mask.sum())} 个训练激酶")
     k_eff = min(k, n - 1)
     topv, topi = sim.topk(k_eff, dim=-1)          # 候选相似度 + 索引
     # B1 数据质量诊断：近零范数 ESM 向量（疑似缺失嵌入零填充）无法产生有意义的相似边
@@ -323,15 +304,14 @@ def add_esm_knn_edges(data, k=10, sim_min=0.75, train_kinase_mask=None):
     if bad:
         logging.warning(f"P2-B1: {bad} 个激酶 ESM 向量范数近零（疑似缺失嵌入零填充），"
                         f"其相似边与输入特征均不可靠，请检查上游 ESM 数据")
-    valid = candidate_valid.gather(1, topi)
-    keep = (topv >= sim_min) & valid
+    keep = topv >= sim_min
     # B1 保底邻居：无邻居激酶强制连 top-ESM_FALLBACK_K 个候选（topv 已按相似度降序），
     # sim_min 只负责截断邻居过多的激酶——保证每个冷启动激酶都有近亲可继承底物特异性
     deg = keep.sum(dim=1)
     iso_mask = deg < ESM_FALLBACK_K
     if iso_mask.any():
         fb_cols = torch.arange(k_eff, device=esm.device).unsqueeze(0) < ESM_FALLBACK_K
-        keep = keep | (iso_mask.unsqueeze(1) & fb_cols & valid)
+        keep = keep | (iso_mask.unsqueeze(1) & fb_cols)
         logging.info(f"P2-B1: {int(iso_mask.sum())} 个激酶低于阈值无相似边，"
                      f"已强制连 top-{ESM_FALLBACK_K} 保底邻居（其 top1 相似度 median="
                      f"{topv[iso_mask, 0].median():.3f}，过低则说明 ESM 嵌入本身可疑）")
@@ -667,6 +647,7 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
 
     # 1. 激酶家族分类损失（仅对训练集中的有标签激酶）
     family_logits = model.predict_family(kinase_emb)   # [K, num_families]
+    fam_probs = torch.softmax(family_logits, dim=-1)   # 复用给 A1 家族原型先验分支
     mask = (kinase_labels != -1) & train_kinase_mask
     if mask.sum() > 0:
         loss_family = criterion_class(family_logits[mask], kinase_labels[mask])
@@ -702,8 +683,8 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
             if (~is_tail).any():
                 neg_k[idx[~is_tail]] = torch.randint(
                     0, num_kinase, (int((~is_tail).sum()),), device=neg_k.device)
-    pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s)
-    neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s)
+    pos_logits = model.interaction_logits(kinase_emb, site_emb, pos_k, pos_s, fam_probs=fam_probs)
+    neg_logits = model.interaction_logits(kinase_emb, site_emb, neg_k, neg_s, fam_probs=fam_probs)
     pred = torch.cat([pos_logits, neg_logits], dim=0)
     label = torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)]).float()
     loss_link = criterion_link(pred, label)
@@ -727,7 +708,7 @@ def train_epoch(model, data, kinase_labels, train_kinase_mask, train_edge_index,
         ki = bk.repeat_interleave(m)
         sj = bs.repeat(m)
         pair_logits = model.interaction_logits(
-            kinase_emb, site_emb, ki, sj
+            kinase_emb, site_emb, ki, sj, fam_probs=fam_probs
         ).view(m, m)
         # 剔除非对角的已知真边（不作为负样本参与分母）
         with torch.no_grad():
@@ -903,7 +884,7 @@ def select_best_f1_threshold(labels, preds):
     
 # ==================== A1 全候选排序评估 ====================
 def _score_kinase_all_sites(model, kinase_emb, site_emb, k_id, num_site,
-                            site_chunk=FULL_RANK_SITE_CHUNK):
+                            fam_probs=None, site_chunk=FULL_RANK_SITE_CHUNK):
     """单个激酶在全部位点上的打分（logit）。logit 与概率严格单调等价，排序指标不变。"""
     device = kinase_emb.device
     out = torch.empty(num_site, dtype=torch.float32, device=device)
@@ -912,7 +893,7 @@ def _score_kinase_all_sites(model, kinase_emb, site_emb, k_id, num_site,
         s_idx = torch.arange(start, end, dtype=torch.long, device=device)
         k_idx = torch.full((end - start,), int(k_id), dtype=torch.long, device=device)
         out[start:end] = model.interaction_logits(
-            kinase_emb, site_emb, k_idx, s_idx
+            kinase_emb, site_emb, k_idx, s_idx, fam_probs=fam_probs
         )
     return out
 
@@ -934,7 +915,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
                                     kinase_labels=None, family_names=None,
                                     kinase_names=None, max_kinases=0,
                                     site_chunk=FULL_RANK_SITE_CHUNK,
-                                    split_name='test',
+                                    split_name='test', save_csv=False,
                                     out_dir=FULL_RANK_OUT_DIR, date_tag=None,
                                     verbose=True):
     """
@@ -956,6 +937,9 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
         emb = model(embed_data)
         kinase_emb, site_emb = emb['kinase'], emb['site']
         num_site = min(int(num_site), int(site_emb.size(0)))
+        # 家族概率只算一次，避免每个位点分块重复前向
+        fam_probs = torch.softmax(model.predict_family(kinase_emb), dim=-1)
+
         ek = edge_index[0].detach().cpu().numpy()
         es = edge_index[1].detach().cpu().numpy()
         pos_by_k = defaultdict(set)
@@ -973,7 +957,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
         for k_id, site_set in tqdm(items, desc=f'全候选排序[{split_name}]', leave=False):
             scores = _score_kinase_all_sites(
                 model, kinase_emb, site_emb, k_id, num_site,
-                site_chunk=site_chunk
+                fam_probs=fam_probs, site_chunk=site_chunk
             ).cpu().numpy()
             # 一次性排出全部位点名次（1 为最高分）；并列按稳定排序处理
             order = np.argsort(-scores, kind='stable')
@@ -1017,6 +1001,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
             pooled_labels.append(label_vec)
             pooled_ranks.append(pos_ranks)
 
+        del fam_probs
 
     if not rows:
         logging.warning(f"[全候选/{split_name}] 该 split 无正边，跳过")
@@ -1112,6 +1097,15 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
                 for name, r in worst.iterrows()
             )
         )
+
+        if save_csv:
+            os.makedirs(out_dir, exist_ok=True)
+            p_kin = os.path.join(out_dir, f"{split_name}_per_kinase_{tag}.csv")
+            df.sort_values('full_ap').to_csv(p_kin, index=False, encoding='utf-8-sig')
+            p_fam = os.path.join(out_dir, f"{split_name}_family_{tag}.csv")
+            fam_df.to_csv(p_fam, encoding='utf-8-sig')
+            logging.info(f"[全候选/{split_name}] 明细已保存: {p_kin} | {p_fam}")
+
     return fr
 
 
@@ -1157,6 +1151,7 @@ def main():
     # 3. 获取模型输入维度
     esm_dim = data['kinase'].esm_x.size(1)
     n2v_dim = data['kinase'].n2v_x.size(1)
+    site_dim = data['site'].x.size(1)
     
     # 4. 划分数据集（7:2:1）
     # ---- 激酶节点划分（分类任务）----
@@ -1216,12 +1211,7 @@ def main():
     
     # P2-B1: ESM-kNN 相似激酶边（仅用序列特征，无标注泄漏），必须在 clone 前加到 data：
     # 冷启动激酶经此从序列相似的训练激酶继承底物特异性
-    # 与链接预测训练边严格对齐：val/test 激酶只能从训练激酶检索相似边
-    link_train_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=full_edge_index.device)
-    link_train_kmask[train_edge_index[0]] = True
-    num_sim_edges = add_esm_knn_edges(
-        data, ESM_KNN_K, ESM_SIM_MIN, train_kinase_mask=link_train_kmask
-    )
+    num_sim_edges = add_esm_knn_edges(data, ESM_KNN_K, ESM_SIM_MIN)
     # P2-B2: 家族→大组层级（KMeans 聚类家族 ESM 质心，适配任意家族命名体系）
     group_labels, family_group_map = build_family_groups(data, kinase_labels, num_families, NUM_KINASE_GROUPS, RANDOM_SEED)
     group_labels = group_labels.to(DEVICE)
@@ -1262,20 +1252,6 @@ def main():
     train_data = data.clone()
     train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
     train_data['site', 'rev_phosphorylates', 'kinase'].edge_index = train_edge_index[[1,0]]
-
-    # 位点特征扩展（训练边构建的 site_deg + 检索谱的位点级聚合），
-    site_deg = np.bincount(train_edge_index[1].cpu().numpy(), minlength=num_site)
-    # 检索谱的“位点级”聚合（用训练边构建的 retrieval_raw，无泄漏）
-    prof_col_max = retrieval_raw.max(dim=0).values.cpu().numpy() if USE_RETRIEVAL_PROFILE else np.zeros(num_site)
-    prof_col_sum = retrieval_raw.sum(dim=0).cpu().numpy() if USE_RETRIEVAL_PROFILE else np.zeros(num_site)
-    extra = np.stack([np.log1p(site_deg), prof_col_max, prof_col_sum], axis=1)  # [S, 3]
-    extra_t = torch.tensor(extra, dtype=torch.float32, device=DEVICE)
-    for d in (data, train_data):
-        d['site'].x = torch.cat([d['site'].x, extra_t], dim=1)
-
-    # 输入维度必须在附加 site_deg / retrieval 统计特征之后读取：
-    # 原始 ESM 1152 维 + 3 维扩展 = 1155，避免 site_proj 维度不匹配
-    site_dim = data['site'].x.size(1)
 
     # 将划分掩码和边索引移到设备
     train_kinase_mask = train_kinase_mask.to(DEVICE)
@@ -1345,38 +1321,6 @@ def main():
     _ek = train_edge_index[0].cpu().numpy()
     train_deg = np.bincount(_ek, minlength=num_kinase).astype(np.float64)
     _w = 1.0 / np.maximum(train_deg[_ek], 1.0) ** DEGREE_ALPHA
-    # 分层冷启动采样：再乘家族稀有度分层倍数——独苗/稀有家族的训练边过采样，
-    # 让其家族级模式（原型/检索谱）获得足够梯度，同家族 holdout 激酶才有东西可继承
-    if STRATIFIED_COLD_START:
-        train_k_set = np.unique(_ek)
-        # 家族在"链接训练激酶"中的有效成员数（val/test 同家族成员不算继承来源）
-        fam_train_count = np.zeros(int(num_families), dtype=np.int64)
-        for _k in train_k_set:
-            _lab = int(kinase_family_np[_k])
-            if _lab != -1:
-                fam_train_count[_lab] += 1
-        tier_w = np.ones(num_kinase, dtype=np.float64)
-        tier_tag = np.full(num_kinase, -1, dtype=np.int8)
-        for _k in train_k_set:
-            _lab = int(kinase_family_np[_k])
-            if _lab == -1:
-                tier_w[_k] = ORPHAN_WEIGHT
-            else:
-                _n = fam_train_count[_lab]
-                _tier = 0 if _n <= FAMILY_RARITY_TIERS[0] else \
-                        1 if _n <= FAMILY_RARITY_TIERS[1] else \
-                        2 if _n <= FAMILY_RARITY_TIERS[2] else 3
-                tier_w[_k] = FAMILY_RARITY_WEIGHTS[_tier]
-                tier_tag[_k] = _tier
-        # 分层统计：每档的训练边占比（诊断强化是否真的给了小众家族）
-        _stat = []
-        for _tier, _mult in enumerate(FAMILY_RARITY_WEIGHTS):
-            _mask = tier_tag[_ek] == _tier
-            _stat.append(f"档{_tier + 1}(x{_mult:g}) {int(_mask.sum())} 边 {_mask.mean() * 100:.1f}%")
-        _orph = np.isin(_ek, np.where(tier_tag == -1)[0])
-        _stat.append(f"无标签(x{ORPHAN_WEIGHT:g}) {int(_orph.sum())} 边 {_orph.mean() * 100:.1f}%")
-        logging.info("分层冷启动采样: " + " | ".join(_stat))
-        _w = _w * tier_w[_ek]
     train_edge_weights = _w / _w.sum()
     hard_ctx = {
         'kinase_family': kinase_family_np,
@@ -1443,7 +1387,16 @@ def main():
                 f"标定: {format_calib(model)}"
             )
 
-            # scheduler.step(pr_sel)
+            # A1: 全候选排序监控（训练期只算 val，按 FULL_RANK_EVERY 降频，避免拖慢训练）
+            if FULL_RANK_EVAL and FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0:
+                fr_val = evaluate_full_candidate_ranking(
+                    model, train_data, val_edge_index, num_site,
+                    kinase_labels=kinase_labels, family_names=family_names,
+                    kinase_names=kinase_names, max_kinases=FULL_RANK_MAX_KINASES,
+                    split_name='val', save_csv=False, verbose=False,
+                )
+                logging.info(f"  [全候选/val] {_format_full_rank_short(fr_val)}")
+
             if val_pr_auc > best_val_auc:
                 best_val_auc = val_pr_auc
                 patience_counter = 0
