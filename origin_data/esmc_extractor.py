@@ -46,6 +46,7 @@ def fasta2esm(
         fasta_file,
         output_dir,
         repr_layers:list=training_config['repr_layers'], # esmc-600m-2024-12 has 36 layers
+        max_len:int=2048,          # 单条序列长度上限（ESMC 位置上限；超长序列截断）
     ):
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
@@ -59,42 +60,58 @@ def fasta2esm(
         name_list.append(lines[0].split()[0])
         sequence_list.append(''.join(lines[1:]))
     fp.close()
-    
+
     Nseq=len(sequence_list)
-    print('Embedding %d sequence from %s to %s'%(Nseq,fasta_file,output_dir))
-    
+    n_trunc=sum(1 for s in sequence_list if len(s)>max_len)
+    print('Embedding %d sequences from %s to %s'%(Nseq,fasta_file,output_dir))
+    if n_trunc:
+        print('  注意: %d 条序列超过 %daa，将截断为前 %daa（只影响极少数超长蛋白）'
+              %(n_trunc,max_len,max_len))
+    print('  长度分布: mean=%d, max=%d'
+          %(sum(len(s) for s in sequence_list)//max(Nseq,1),
+            max((len(s) for s in sequence_list), default=0)))
+
     device='cpu'
     if torch.cuda.is_available():
         os.environ["CUDA_VISIBLE_DEVICES"] = '0'
         device='cuda'
-    
+
     print("Using "+device)
 
     client = ESMC.from_pretrained("esmc_600m").to(device)
     # client = load_pretrained_esmc_600m(device=device)
     EMBEDDING_CONFIG = LogitsConfig(
-        #sequence=True, 
-        #return_embeddings=True, 
+        #sequence=True,
+        #return_embeddings=True,
         return_hidden_states=True
     )
+    failed=[]
     for n in tqdm(range(Nseq)):
         name=name_list[n]
         safe_name = name.replace('/', '_').replace('\\', '_').replace(':', '_')
         out_file = os.path.join(output_dir, safe_name + ".npy")
         if os.path.isfile(out_file):
-            continue
-        #print(out_file)
-        result={'name':name,'mean':dict()} # 1152
-        sequence=sequence_list[n][:2048]
-        protein = ESMProtein(sequence=sequence)
-        protein_tensor = client.encode(protein)
-        logits_output = client.logits(protein_tensor, EMBEDDING_CONFIG)
-        hidden_states = logits_output.hidden_states.mean(axis=2)
-        for layer in repr_layers:
-            result['mean'][layer]=hidden_states[layer-1][0].cpu(
-                ).to(dtype=torch.float32).numpy()
-        np.save(out_file, result, allow_pickle=True)
-    return
+            continue    # 断点续传：已提取的跳过（失败重跑时只补缺）
+        try:
+            result={'name':name,'mean':dict()} # 1152
+            sequence=sequence_list[n][:max_len]
+            protein = ESMProtein(sequence=sequence)
+            protein_tensor = client.encode(protein)
+            logits_output = client.logits(protein_tensor, EMBEDDING_CONFIG)
+            hidden_states = logits_output.hidden_states.mean(axis=2)
+            for layer in repr_layers:
+                result['mean'][layer]=hidden_states[layer-1][0].cpu(
+                    ).to(dtype=torch.float32).numpy()
+            np.save(out_file, result, allow_pickle=True)
+        except Exception as e:
+            # 单条失败不中断整批（显存不足/瞬时错误），记录后继续，重跑只补缺
+            failed.append(name)
+            print('\n  [失败] %s: %s'%(name, e))
+            torch.cuda.empty_cache() if device=='cuda' else None
+    print('完成: 成功 %d 条, 失败 %d 条%s'
+          %(Nseq-len(failed), len(failed),
+            ('，重跑同一命令可仅补失败项' if failed else '')))
+    return failed
 
 def extract_embeddings(fasta_file):
     fasta2esm( fasta_file, settings['embedding_dir'])
@@ -228,6 +245,14 @@ def extract_homolog_embeddings(fasta_file, db):
     return
 
 if __name__=="__main__":
-    fasta_file='origin_data/all_windows.fasta'
-    output_dir='origin_data/substate/out/'
-    fasta2esm(fasta_file,output_dir)
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='ESMC-600M 序列嵌入提取（支持任意长度 fasta，>2048aa 截断；逐条保存可断点续传）')
+    parser.add_argument('--fasta', default='origin_data/all_windows.fasta',
+                        help='输入 fasta（窗口 fasta 或全长蛋白 fasta，如 origin_data/Total.fasta）')
+    parser.add_argument('--out', default='origin_data/substate/out/',
+                        help='输出目录（.npy 每序列一个，含 mean:{34,35,36} 各 1152 维）')
+    parser.add_argument('--max-len', type=int, default=2048,
+                        help='单条序列长度上限，超出截断（默认 2048）')
+    args = parser.parse_args()
+    fasta2esm(args.fasta, args.out, max_len=args.max_len)
