@@ -29,6 +29,10 @@ PPI_CSV = str(PROJECT_ROOT / "PPI/kinase_ppi_network.csv")                      
 KINASE_SUBSTRATE_CSV = str(PROJECT_ROOT / "origin_data/kinase_substrate_pairs_detailed.csv")  # 激酶-底物关系
 SITE_FEATURE_DIR = str(PROJECT_ROOT / "origin_data/substate")                   # 底物位点特征目录
 KINASE_FEATURE_DIRS = [str(PROJECT_ROOT / "origin_data/kinase"), str(PROJECT_ROOT / "origin_data/kinase/out")]  # 激酶特征目录（ESM）
+# 全长底物蛋白 ESMC 特征（esmc_extractor.py --fasta Total.fasta 的输出），
+# 直接作为 site.x（替换原 31aa 窗口特征）：位点携带蛋白全局上下文
+# （docking/无序度/整体家族偏好）；位点局部特异性由 motif 编码器提供
+PROTEIN_FEATURE_DIR = str(PROJECT_ROOT / "origin_data/substate/protein_out/")
 OUTPUT_GRAPH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph.pt")
 
 # Node2Vec 参数
@@ -115,6 +119,36 @@ def load_site_features():
         else:
             logging.warning(f"无法从文件名 {fname} 解析 site_id，跳过")
     logging.info(f"加载了 {len(feat_dict)} 个底物位点的特征")
+    return feat_dict
+
+# ==================== 加载全长底物蛋白 ESMC 特征 ====================
+def load_substrate_protein_features():
+    """返回字典 {EPSD_ID: 1152 维 ESMC mean 特征张量}。
+
+    读取 esmc_extractor.py 对 Total.fasta（全长底物蛋白）的提取输出
+    （每个 .npy 含 mean:{34,35,36} 各 1152 维，取三层平均）。
+    目录不存在或为空时返回空字典（上游自动退回纯窗口特征）。
+    """
+    if not os.path.isdir(PROTEIN_FEATURE_DIR):
+        raise FileNotFoundError(
+            f"全长蛋白特征目录不存在: {PROTEIN_FEATURE_DIR}\n"
+            f"先运行: python3 origin_data/esmc_extractor.py "
+            f"--fasta origin_data/Total.fasta --out {PROTEIN_FEATURE_DIR}")
+    feat_dict = {}
+    for fname in os.listdir(PROTEIN_FEATURE_DIR):
+        if not fname.endswith('.npy'):
+            continue
+        data = np.load(os.path.join(PROTEIN_FEATURE_DIR, fname), allow_pickle=True).item()
+        mean_dict = data.get('mean') if isinstance(data, dict) else None
+        if not mean_dict:
+            continue
+        layer_feats = [mean_dict[l].flatten() for l in FEATURE_LAYERS if l in mean_dict]
+        if not layer_feats:
+            continue
+        # name 或文件名均为 EPSD_ID（Total.fasta 的 header）
+        epsd_id = data.get('name', os.path.splitext(fname)[0])
+        feat_dict[epsd_id] = torch.tensor(np.mean(layer_feats, axis=0), dtype=torch.float)
+    logging.info(f"加载了 {len(feat_dict)} 个全长底物蛋白的 ESMC 特征")
     return feat_dict
 
 # ==================== 使用 Node2Vec 生成激酶特征 ====================
@@ -219,10 +253,26 @@ def build_joint_graph():
         if k in kinase_n2v:
             n2v_x[i] = kinase_n2v[k]
     
-    # 底物节点集合来自过滤后的关系
+    # 底物节点集合来自过滤后的关系（节点集仍由窗口特征目录定义，保证图结构与历史一致）
     all_sites = sorted(df_ks_filtered['site_id'].unique())
     site_to_idx = {s: i for i, s in enumerate(all_sites)}
-    site_x = torch.stack([site_feat[s] for s in all_sites], dim=0)
+
+    # site.x 直接替换为全长蛋白 ESMC 特征（丢弃窗口 mean 特征，位点位点区分交给 motif 编码器）
+    protein_feat = load_substrate_protein_features()
+    prot_dim = next(iter(protein_feat.values())).shape[0]
+    site_prots = [s.rsplit('_', 1)[0] for s in all_sites]
+    site_x = torch.zeros(len(all_sites), prot_dim)
+    n_missing = 0
+    for i, p in enumerate(site_prots):
+        if p in protein_feat:
+            site_x[i] = protein_feat[p]
+        else:
+            n_missing += 1
+    logging.info(f"site.x = 全长蛋白 ESMC 特征 {prot_dim} 维（已替换窗口特征）| "
+                 f"覆盖蛋白 {len(set(site_prots) & set(protein_feat))}/{len(set(site_prots))}，"
+                 f"缺失位点 {n_missing}/{len(all_sites)}（零填充）")
+    if n_missing > 0.05 * len(all_sites):
+        logging.warning("超过 5% 位点的蛋白缺少全长特征——确认 protein_out 提取是否完整")
     
     # 构建 HeteroData 对象
     data = HeteroData()
