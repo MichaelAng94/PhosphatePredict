@@ -1010,11 +1010,11 @@ def main():
         n2v_dim=n2v_dim,
         site_dim=site_dim,
         num_families=num_families,
-        hidden_dim=128,
+        hidden_dim=256,
         num_heads=4,
         num_hgt_layers=2,
-        num_transformer_layers=1,
-        dropout=0.1,
+        num_transformer_layers=2,
+        dropout=0.2,
         motif_len=motif_len,
         num_groups=int(family_group_map.size(1)),
         family_group_map=family_group_map,
@@ -1210,8 +1210,7 @@ def main():
         fr_final[split_name] = evaluate_full_candidate_ranking(
             model, train_data, eidx, num_site,
             kinase_labels=kinase_labels, family_names=family_names,
-            kinase_names=kinase_names, split_name=split_name,
-            save_csv=True, verbose=True,
+            kinase_names=kinase_names, split_name=split_name, verbose=True
         )
     fr_t = fr_final.get('test') or {}
     if fr_t:
