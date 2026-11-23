@@ -1,0 +1,101 @@
+2026-11-23 15:31:14,791 - INFO - 训练日志本地保存: /mnt/d/PhosphatePredict/logs/train_no_transformer_20261123_153114.log
+2026-11-23 15:31:14,792 - INFO - 实验：无 Transformer + 原始静态 ESM 检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边
+2026-11-23 15:31:14,792 - INFO - 独立 checkpoint: /mnt/d/PhosphatePredict/model/best_joint_model_no_transformer_20261123_153114.pt
+2026-11-23 15:31:14,793 - INFO - 加载异构图...
+2026-11-23 15:31:15,088 - INFO - 激酶节点数: 567, 底物节点数: 11123
+2026-11-23 15:31:15,163 - INFO - 激酶家族类别数: 130, 有标签的激酶数: 359
+2026-11-23 15:31:15,192 - INFO - 激酶分类 - 训练: 251, 验证: 72, 测试: 36
+2026-11-23 15:31:15,216 - INFO - 链接预测 - 按激酶划分(cold-start): 训练激酶 317, 验证激酶 90, 测试激酶 46 | 训练边: 20155, 验证边: 5146, 测试边: 2483
+2026-11-23 15:31:15,311 - WARNING - P2-B1: 1 个激酶 ESM 向量范数近零（疑似缺失嵌入零填充），其相似边与输入特征均不可靠，请检查上游 ESM 数据
+2026-11-23 15:31:15,326 - INFO - P2-B1: 1 个激酶低于阈值无相似边，已强制连 top-1 保底邻居（其 top1 相似度 median=0.000，过低则说明 ESM 嵌入本身可疑）
+2026-11-23 15:31:15,416 - INFO - P2-B1: 候选相似度 top10 分布 median=0.967 min=0.000 max=1.000 | 阈值 0.75 后边数 8300，中位度数 10，无邻居激酶 0/567
+2026-11-23 15:31:15,532 - INFO - P2-B2: 130 个家族聚为 12 个大组
+2026-11-23 15:31:15,587 - INFO - R1: 检索谱先验 top20/tau=0.05 构建完成，有非零谱的激酶占比 100.0%（其余激酶无近邻训练底物可继承，退化为纯学习分支）
+2026-11-23 15:31:15,589 - INFO - R1.1: 置信度调制 center=0.85/temp=0.04，conf 中位数 0.966，低置信(<0.25)激酶 0.2%（谱先验自动关闭，防错误先验）
+2026-11-23 15:31:15,590 - INFO - R1.1 conf 诊断: TAF1=0.967, RON=0.963, PKM=0.845, CHAK2=0.973, LKB1=0.939, VRK1=0.938, AURC=0.865, P38D=0.977, EGFR=0.966, TTK=0.965
+2026-11-23 15:31:15,602 - INFO - 位点 motif 特征: 启用, 窗口长度 31
+2026-11-23 15:31:15,660 - INFO - 优化器: 门控/偏置 3 个参数 @ lr=0.0005，主干 64 个 @ lr=9e-05
+2026-11-23 15:31:15,665 - INFO - P1 难负上下文: 有家族标签激酶 359, 蛋白 3792 个（多位点蛋白 2154 个）
+2026-11-23 15:31:21,797 - INFO - Epoch 005 | Loss: 6.1865 [fam 2.370 | link 0.437 | rank 0.395 | nce 2.137 | grp 0.847] | Train Acc: 0.0996, Val Acc: 0.1250, Val G-Acc: 0.4722 | Train AUC: 0.8573, Val AUC: 0.6834, Val PR-AUC: 0.2744 | Val F1@0.5: 0.0000 | Val F1*(thr=0.203): 0.3630, Prec*: 0.2828, Rec*: 0.5070 | 标定: ret +0.02 | bil +0.01
+2026-11-23 15:31:21,922 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.2744, Val F1* = 0.3630 @ thr 0.203)
+2026-11-23 15:31:27,718 - INFO - Epoch 010 | Loss: 5.3835 [fam 2.276 | link 0.401 | rank 0.270 | nce 1.906 | grp 0.531] | Train Acc: 0.2390, Val Acc: 0.1806, Val G-Acc: 0.6806 | Train AUC: 0.9293, Val AUC: 0.7550, Val PR-AUC: 0.3483 | Val F1@0.5: 0.0000 | Val F1*(thr=0.233): 0.4240, Prec*: 0.3149, Rec*: 0.6489 | 标定: ret +0.03 | bil +0.03
+2026-11-23 15:31:27,813 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.3483, Val F1* = 0.4240 @ thr 0.233)
+2026-11-23 15:31:33,496 - INFO - Epoch 015 | Loss: 4.7980 [fam 2.178 | link 0.375 | rank 0.217 | nce 1.685 | grp 0.343] | Train Acc: 0.3227, Val Acc: 0.1528, Val G-Acc: 0.8056 | Train AUC: 0.9642, Val AUC: 0.8019, Val PR-AUC: 0.4183 | Val F1@0.5: 0.0226 | Val F1*(thr=0.296): 0.4762, Prec*: 0.3971, Rec*: 0.5946 | 标定: ret +0.04 | bil +0.05
+2026-11-23 15:31:33,620 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.4183, Val F1* = 0.4762 @ thr 0.296)
+2026-11-23 15:31:39,436 - INFO - Epoch 020 | Loss: 4.4164 [fam 2.087 | link 0.362 | rank 0.192 | nce 1.536 | grp 0.240] | Train Acc: 0.3625, Val Acc: 0.1806, Val G-Acc: 0.7778 | Train AUC: 0.9758, Val AUC: 0.8197, Val PR-AUC: 0.4450 | Val F1@0.5: 0.0932 | Val F1*(thr=0.250): 0.4998, Prec*: 0.3683, Rec*: 0.7771 | 标定: ret +0.04 | bil +0.07
+2026-11-23 15:31:39,561 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.4450, Val F1* = 0.4998 @ thr 0.250)
+2026-11-23 15:31:45,195 - INFO - Epoch 025 | Loss: 4.0490 [fam 1.986 | link 0.347 | rank 0.169 | nce 1.378 | grp 0.169] | Train Acc: 0.4104, Val Acc: 0.1806, Val G-Acc: 0.8056 | Train AUC: 0.9819, Val AUC: 0.8410, Val PR-AUC: 0.4947 | Val F1@0.5: 0.1427 | Val F1*(thr=0.256): 0.5286, Prec*: 0.3914, Rec*: 0.8142 | 标定: ret +0.04 | bil +0.08
+2026-11-23 15:31:45,635 - INFO -   [全候选/val] AP宏 0.0497 | AP加权 0.1098 | R@50 0.064 | Hits@10 0.211 | MRR 0.009
+2026-11-23 15:31:45,706 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.4947, Val F1* = 0.5286 @ thr 0.256)
+2026-11-23 15:31:51,302 - INFO - Epoch 030 | Loss: 3.6919 [fam 1.879 | link 0.329 | rank 0.142 | nce 1.216 | grp 0.126] | Train Acc: 0.4183, Val Acc: 0.2083, Val G-Acc: 0.8056 | Train AUC: 0.9859, Val AUC: 0.8473, Val PR-AUC: 0.5005 | Val F1@0.5: 0.1832 | Val F1*(thr=0.311): 0.5514, Prec*: 0.4274, Rec*: 0.7765 | 标定: ret +0.03 | bil +0.10
+2026-11-23 15:31:51,436 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.5005, Val F1* = 0.5514 @ thr 0.311)
+2026-11-23 15:31:57,256 - INFO - Epoch 035 | Loss: 3.5148 [fam 1.782 | link 0.324 | rank 0.137 | nce 1.176 | grp 0.097] | Train Acc: 0.4502, Val Acc: 0.2083, Val G-Acc: 0.7917 | Train AUC: 0.9880, Val AUC: 0.8510, Val PR-AUC: 0.5085 | Val F1@0.5: 0.2098 | Val F1*(thr=0.347): 0.5568, Prec*: 0.4394, Rec*: 0.7600 | 标定: ret +0.03 | bil +0.11
+2026-11-23 15:31:57,356 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.5085, Val F1* = 0.5568 @ thr 0.347)
+2026-11-23 15:32:03,027 - INFO - Epoch 040 | Loss: 3.3156 [fam 1.671 | link 0.316 | rank 0.132 | nce 1.120 | grp 0.076] | Train Acc: 0.4622, Val Acc: 0.2361, Val G-Acc: 0.7778 | Train AUC: 0.9908, Val AUC: 0.8589, Val PR-AUC: 0.5447 | Val F1@0.5: 0.2944 | Val F1*(thr=0.376): 0.5639, Prec*: 0.4545, Rec*: 0.7427 | 标定: ret +0.02 | bil +0.12
+2026-11-23 15:32:03,161 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.5447, Val F1* = 0.5639 @ thr 0.376)
+2026-11-23 15:32:08,947 - INFO - Epoch 045 | Loss: 3.0526 [fam 1.551 | link 0.304 | rank 0.117 | nce 1.023 | grp 0.058] | Train Acc: 0.4861, Val Acc: 0.2500, Val G-Acc: 0.8056 | Train AUC: 0.9907, Val AUC: 0.8651, Val PR-AUC: 0.5542 | Val F1@0.5: 0.2877 | Val F1*(thr=0.386): 0.5829, Prec*: 0.4977, Rec*: 0.7035 | 标定: ret +0.02 | bil +0.13
+2026-11-23 15:32:09,032 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.5542, Val F1* = 0.5829 @ thr 0.386)
+2026-11-23 15:32:14,649 - INFO - Epoch 050 | Loss: 2.7977 [fam 1.430 | link 0.296 | rank 0.106 | nce 0.914 | grp 0.051] | Train Acc: 0.5259, Val Acc: 0.2917, Val G-Acc: 0.7778 | Train AUC: 0.9919, Val AUC: 0.8646, Val PR-AUC: 0.5624 | Val F1@0.5: 0.2913 | Val F1*(thr=0.392): 0.5837, Prec*: 0.4956, Rec*: 0.7099 | 标定: ret +0.01 | bil +0.14
+2026-11-23 15:32:15,071 - INFO -   [全候选/val] AP宏 0.0939 | AP加权 0.1285 | R@50 0.075 | Hits@10 0.356 | MRR 0.014
+2026-11-23 15:32:15,139 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.5624, Val F1* = 0.5837 @ thr 0.392)
+2026-11-23 15:32:20,573 - INFO - Epoch 055 | Loss: 2.6681 [fam 1.327 | link 0.295 | rank 0.106 | nce 0.906 | grp 0.034] | Train Acc: 0.5538, Val Acc: 0.3056, Val G-Acc: 0.7917 | Train AUC: 0.9908, Val AUC: 0.8699, Val PR-AUC: 0.5824 | Val F1@0.5: 0.2777 | Val F1*(thr=0.397): 0.5913, Prec*: 0.5288, Rec*: 0.6704 | 标定: ret +0.01 | bil +0.15
+2026-11-23 15:32:20,659 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.5824, Val F1* = 0.5913 @ thr 0.397)
+2026-11-23 15:32:26,167 - INFO - Epoch 060 | Loss: 2.5341 [fam 1.232 | link 0.294 | rank 0.110 | nce 0.866 | grp 0.031] | Train Acc: 0.6016, Val Acc: 0.3056, Val G-Acc: 0.8194 | Train AUC: 0.9926, Val AUC: 0.8683, Val PR-AUC: 0.5710 | Val F1@0.5: 0.2869 | Val F1*(thr=0.387): 0.5831, Prec*: 0.5159, Rec*: 0.6704 | 标定: ret +0.01 | bil +0.16
+2026-11-23 15:32:31,710 - INFO - Epoch 065 | Loss: 2.4466 [fam 1.137 | link 0.285 | rank 0.103 | nce 0.895 | grp 0.026] | Train Acc: 0.6056, Val Acc: 0.3333, Val G-Acc: 0.8056 | Train AUC: 0.9958, Val AUC: 0.8781, Val PR-AUC: 0.6077 | Val F1@0.5: 0.2982 | Val F1*(thr=0.388): 0.5893, Prec*: 0.5219, Rec*: 0.6768 | 标定: ret +0.00 | bil +0.17
+2026-11-23 15:32:31,787 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.6077, Val F1* = 0.5893 @ thr 0.388)
+2026-11-23 15:32:37,349 - INFO - Epoch 070 | Loss: 2.2106 [fam 1.044 | link 0.278 | rank 0.097 | nce 0.773 | grp 0.018] | Train Acc: 0.6454, Val Acc: 0.3333, Val G-Acc: 0.8056 | Train AUC: 0.9961, Val AUC: 0.8717, Val PR-AUC: 0.5971 | Val F1@0.5: 0.2752 | Val F1*(thr=0.379): 0.5857, Prec*: 0.5068, Rec*: 0.6935 | 标定: ret -0.00 | bil +0.18
+2026-11-23 15:32:42,950 - INFO - Epoch 075 | Loss: 2.0835 [fam 0.963 | link 0.270 | rank 0.087 | nce 0.741 | grp 0.022] | Train Acc: 0.6813, Val Acc: 0.3472, Val G-Acc: 0.8056 | Train AUC: 0.9957, Val AUC: 0.8756, Val PR-AUC: 0.6009 | Val F1@0.5: 0.2796 | Val F1*(thr=0.387): 0.5841, Prec*: 0.5395, Rec*: 0.6366 | 标定: ret -0.00 | bil +0.19
+2026-11-23 15:32:43,396 - INFO -   [全候选/val] AP宏 0.1022 | AP加权 0.1368 | R@50 0.081 | Hits@10 0.333 | MRR 0.014
+2026-11-23 15:32:48,922 - INFO - Epoch 080 | Loss: 1.9486 [fam 0.878 | link 0.264 | rank 0.085 | nce 0.703 | grp 0.018] | Train Acc: 0.7291, Val Acc: 0.4167, Val G-Acc: 0.8194 | Train AUC: 0.9967, Val AUC: 0.8774, Val PR-AUC: 0.6056 | Val F1@0.5: 0.2644 | Val F1*(thr=0.390): 0.5921, Prec*: 0.5473, Rec*: 0.6450 | 标定: ret -0.01 | bil +0.19
+2026-11-23 15:32:54,496 - INFO - Epoch 085 | Loss: 1.9175 [fam 0.800 | link 0.264 | rank 0.088 | nce 0.753 | grp 0.012] | Train Acc: 0.7729, Val Acc: 0.4444, Val G-Acc: 0.8194 | Train AUC: 0.9968, Val AUC: 0.8790, Val PR-AUC: 0.6047 | Val F1@0.5: 0.2865 | Val F1*(thr=0.379): 0.5870, Prec*: 0.5435, Rec*: 0.6380 | 标定: ret -0.01 | bil +0.20
+2026-11-23 15:33:00,120 - INFO - Epoch 090 | Loss: 1.7874 [fam 0.739 | link 0.262 | rank 0.088 | nce 0.679 | grp 0.019] | Train Acc: 0.7888, Val Acc: 0.4444, Val G-Acc: 0.7778 | Train AUC: 0.9958, Val AUC: 0.8876, Val PR-AUC: 0.6166 | Val F1@0.5: 0.2774 | Val F1*(thr=0.366): 0.6097, Prec*: 0.5566, Rec*: 0.6739 | 标定: ret -0.01 | bil +0.21
+2026-11-23 15:33:00,205 - INFO -   -> 保存最佳模型 (Val PR-AUC = 0.6166, Val F1* = 0.6097 @ thr 0.366)
+2026-11-23 15:33:05,902 - INFO - Epoch 095 | Loss: 1.6970 [fam 0.681 | link 0.253 | rank 0.080 | nce 0.672 | grp 0.012] | Train Acc: 0.8406, Val Acc: 0.5139, Val G-Acc: 0.8056 | Train AUC: 0.9958, Val AUC: 0.8808, Val PR-AUC: 0.6134 | Val F1@0.5: 0.2386 | Val F1*(thr=0.365): 0.5923, Prec*: 0.5572, Rec*: 0.6321 | 标定: ret -0.02 | bil +0.21
+2026-11-23 15:33:11,654 - INFO - Epoch 100 | Loss: 1.6133 [fam 0.610 | link 0.257 | rank 0.085 | nce 0.644 | grp 0.017] | Train Acc: 0.8845, Val Acc: 0.5556, Val G-Acc: 0.8194 | Train AUC: 0.9967, Val AUC: 0.8803, Val PR-AUC: 0.6052 | Val F1@0.5: 0.2510 | Val F1*(thr=0.342): 0.5922, Prec*: 0.5066, Rec*: 0.7128 | 标定: ret -0.02 | bil +0.22
+2026-11-23 15:33:12,091 - INFO -   [全候选/val] AP宏 0.1228 | AP加权 0.1444 | R@50 0.081 | Hits@10 0.422 | MRR 0.015
+2026-11-23 15:33:17,784 - INFO - Epoch 105 | Loss: 1.5587 [fam 0.568 | link 0.254 | rank 0.084 | nce 0.641 | grp 0.012] | Train Acc: 0.8884, Val Acc: 0.5694, Val G-Acc: 0.8194 | Train AUC: 0.9977, Val AUC: 0.8810, Val PR-AUC: 0.6064 | Val F1@0.5: 0.2233 | Val F1*(thr=0.324): 0.5922, Prec*: 0.4893, Rec*: 0.7499 | 标定: ret -0.02 | bil +0.22
+2026-11-23 15:33:23,335 - INFO - Epoch 110 | Loss: 1.5211 [fam 0.518 | link 0.249 | rank 0.078 | nce 0.667 | grp 0.009] | Train Acc: 0.9124, Val Acc: 0.5694, Val G-Acc: 0.8056 | Train AUC: 0.9974, Val AUC: 0.8833, Val PR-AUC: 0.6060 | Val F1@0.5: 0.2114 | Val F1*(thr=0.327): 0.6013, Prec*: 0.5037, Rec*: 0.7458 | 标定: ret -0.03 | bil +0.23
+2026-11-23 15:33:28,873 - INFO - Epoch 115 | Loss: 1.5127 [fam 0.468 | link 0.252 | rank 0.084 | nce 0.697 | grp 0.011] | Train Acc: 0.9203, Val Acc: 0.5833, Val G-Acc: 0.7778 | Train AUC: 0.9983, Val AUC: 0.8852, Val PR-AUC: 0.6109 | Val F1@0.5: 0.2000 | Val F1*(thr=0.328): 0.6120, Prec*: 0.5293, Rec*: 0.7254 | 标定: ret -0.03 | bil +0.23
+2026-11-23 15:33:34,449 - INFO - Epoch 120 | Loss: 1.4209 [fam 0.446 | link 0.242 | rank 0.071 | nce 0.649 | grp 0.013] | Train Acc: 0.9283, Val Acc: 0.6528, Val G-Acc: 0.8333 | Train AUC: 0.9972, Val AUC: 0.8865, Val PR-AUC: 0.6108 | Val F1@0.5: 0.2023 | Val F1*(thr=0.310): 0.6109, Prec*: 0.5085, Rec*: 0.7651 | 标定: ret -0.03 | bil +0.24
+2026-11-23 15:33:39,991 - INFO - Epoch 125 | Loss: 1.4177 [fam 0.407 | link 0.245 | rank 0.077 | nce 0.678 | grp 0.010] | Train Acc: 0.9442, Val Acc: 0.6250, Val G-Acc: 0.8194 | Train AUC: 0.9975, Val AUC: 0.8852, Val PR-AUC: 0.6123 | Val F1@0.5: 0.1820 | Val F1*(thr=0.321): 0.6114, Prec*: 0.5245, Rec*: 0.7330 | 标定: ret -0.04 | bil +0.24
+2026-11-23 15:33:40,428 - INFO -   [全候选/val] AP宏 0.0998 | AP加权 0.1395 | R@50 0.083 | Hits@10 0.367 | MRR 0.014
+2026-11-23 15:33:46,005 - INFO - Epoch 130 | Loss: 1.3529 [fam 0.367 | link 0.239 | rank 0.071 | nce 0.668 | grp 0.008] | Train Acc: 0.9562, Val Acc: 0.6528, Val G-Acc: 0.8333 | Train AUC: 0.9974, Val AUC: 0.8848, Val PR-AUC: 0.6106 | Val F1@0.5: 0.1845 | Val F1*(thr=0.315): 0.6056, Prec*: 0.5316, Rec*: 0.7035 | 标定: ret -0.04 | bil +0.25
+2026-11-23 15:33:51,491 - INFO - Epoch 135 | Loss: 1.2953 [fam 0.342 | link 0.240 | rank 0.072 | nce 0.626 | grp 0.016] | Train Acc: 0.9681, Val Acc: 0.6389, Val G-Acc: 0.7917 | Train AUC: 0.9980, Val AUC: 0.8814, Val PR-AUC: 0.6015 | Val F1@0.5: 0.1152 | Val F1*(thr=0.283): 0.5923, Prec*: 0.4778, Rec*: 0.7791 | 标定: ret -0.04 | bil +0.25
+2026-11-23 15:33:56,912 - INFO - Epoch 140 | Loss: 1.3191 [fam 0.312 | link 0.246 | rank 0.085 | nce 0.666 | grp 0.011] | Train Acc: 0.9960, Val Acc: 0.6806, Val G-Acc: 0.8056 | Train AUC: 0.9979, Val AUC: 0.8845, Val PR-AUC: 0.6084 | Val F1@0.5: 0.1003 | Val F1*(thr=0.305): 0.6016, Prec*: 0.5288, Rec*: 0.6976 | 标定: ret -0.04 | bil +0.26
+2026-11-23 15:34:02,402 - INFO - Epoch 145 | Loss: 1.1612 [fam 0.282 | link 0.229 | rank 0.070 | nce 0.571 | grp 0.009] | Train Acc: 0.9920, Val Acc: 0.6528, Val G-Acc: 0.8056 | Train AUC: 0.9984, Val AUC: 0.8827, Val PR-AUC: 0.6024 | Val F1@0.5: 0.1365 | Val F1*(thr=0.304): 0.5961, Prec*: 0.5073, Rec*: 0.7225 | 标定: ret -0.05 | bil +0.26
+2026-11-23 15:34:07,920 - INFO - Epoch 150 | Loss: 1.2097 [fam 0.266 | link 0.230 | rank 0.072 | nce 0.629 | grp 0.012] | Train Acc: 0.9960, Val Acc: 0.6944, Val G-Acc: 0.7917 | Train AUC: 0.9982, Val AUC: 0.8758, Val PR-AUC: 0.5963 | Val F1@0.5: 0.1292 | Val F1*(thr=0.273): 0.5759, Prec*: 0.4615, Rec*: 0.7658 | 标定: ret -0.05 | bil +0.27
+2026-11-23 15:34:08,351 - INFO -   [全候选/val] AP宏 0.1177 | AP加权 0.1515 | R@50 0.095 | Hits@10 0.389 | MRR 0.016
+2026-11-23 15:34:13,872 - INFO - Epoch 155 | Loss: 1.1874 [fam 0.245 | link 0.228 | rank 0.070 | nce 0.635 | grp 0.010] | Train Acc: 0.9960, Val Acc: 0.6944, Val G-Acc: 0.8056 | Train AUC: 0.9981, Val AUC: 0.8789, Val PR-AUC: 0.6001 | Val F1@0.5: 0.1295 | Val F1*(thr=0.278): 0.5893, Prec*: 0.4819, Rec*: 0.7585 | 标定: ret -0.05 | bil +0.27
+2026-11-23 15:34:19,437 - INFO - Epoch 160 | Loss: 1.0697 [fam 0.227 | link 0.224 | rank 0.064 | nce 0.547 | grp 0.009] | Train Acc: 1.0000, Val Acc: 0.6944, Val G-Acc: 0.8194 | Train AUC: 0.9980, Val AUC: 0.8747, Val PR-AUC: 0.5930 | Val F1@0.5: 0.0836 | Val F1*(thr=0.300): 0.5822, Prec*: 0.5150, Rec*: 0.6695 | 标定: ret -0.05 | bil +0.27
+2026-11-23 15:34:24,915 - INFO - Epoch 165 | Loss: 1.1229 [fam 0.223 | link 0.225 | rank 0.064 | nce 0.600 | grp 0.012] | Train Acc: 0.9960, Val Acc: 0.7083, Val G-Acc: 0.8333 | Train AUC: 0.9988, Val AUC: 0.8758, Val PR-AUC: 0.5948 | Val F1@0.5: 0.0841 | Val F1*(thr=0.279): 0.5925, Prec*: 0.5028, Rec*: 0.7211 | 标定: ret -0.06 | bil +0.28
+2026-11-23 15:34:30,324 - INFO - Epoch 170 | Loss: 1.0755 [fam 0.194 | link 0.225 | rank 0.070 | nce 0.569 | grp 0.018] | Train Acc: 1.0000, Val Acc: 0.6667, Val G-Acc: 0.8056 | Train AUC: 0.9978, Val AUC: 0.8846, Val PR-AUC: 0.6100 | Val F1@0.5: 0.1198 | Val F1*(thr=0.295): 0.6085, Prec*: 0.5446, Rec*: 0.6893 | 标定: ret -0.06 | bil +0.28
+2026-11-23 15:34:35,795 - INFO - Epoch 175 | Loss: 1.0900 [fam 0.181 | link 0.225 | rank 0.066 | nce 0.606 | grp 0.013] | Train Acc: 1.0000, Val Acc: 0.6944, Val G-Acc: 0.8056 | Train AUC: 0.9985, Val AUC: 0.8786, Val PR-AUC: 0.5965 | Val F1@0.5: 0.0809 | Val F1*(thr=0.261): 0.5875, Prec*: 0.4738, Rec*: 0.7730 | 标定: ret -0.06 | bil +0.28
+2026-11-23 15:34:36,230 - INFO -   [全候选/val] AP宏 0.1056 | AP加权 0.1350 | R@50 0.084 | Hits@10 0.422 | MRR 0.016
+2026-11-23 15:34:41,780 - INFO - Epoch 180 | Loss: 1.0564 [fam 0.161 | link 0.223 | rank 0.070 | nce 0.594 | grp 0.008] | Train Acc: 1.0000, Val Acc: 0.7083, Val G-Acc: 0.8056 | Train AUC: 0.9984, Val AUC: 0.8847, Val PR-AUC: 0.6126 | Val F1@0.5: 0.0816 | Val F1*(thr=0.262): 0.5987, Prec*: 0.4870, Rec*: 0.7767 | 标定: ret -0.06 | bil +0.29
+2026-11-23 15:34:47,339 - INFO - Epoch 185 | Loss: 1.0165 [fam 0.161 | link 0.218 | rank 0.063 | nce 0.563 | grp 0.012] | Train Acc: 1.0000, Val Acc: 0.6806, Val G-Acc: 0.7917 | Train AUC: 0.9982, Val AUC: 0.8756, Val PR-AUC: 0.5890 | Val F1@0.5: 0.0897 | Val F1*(thr=0.252): 0.5842, Prec*: 0.4675, Rec*: 0.7787 | 标定: ret -0.07 | bil +0.29
+2026-11-23 15:34:52,883 - INFO - Epoch 190 | Loss: 0.9514 [fam 0.150 | link 0.212 | rank 0.059 | nce 0.522 | grp 0.008] | Train Acc: 1.0000, Val Acc: 0.6944, Val G-Acc: 0.8056 | Train AUC: 0.9985, Val AUC: 0.8740, Val PR-AUC: 0.5960 | Val F1@0.5: 0.1033 | Val F1*(thr=0.270): 0.5784, Prec*: 0.4898, Rec*: 0.7062 | 标定: ret -0.07 | bil +0.29
+2026-11-23 15:34:52,884 - INFO - Early stopping at epoch 190
+2026-11-23 15:34:52,885 - INFO - 训练完成，最佳验证集 PR-AUC: 0.6166
+2026-11-23 15:34:53,039 - INFO - 阈值校准: val 最优 F1 = 0.6097 @ 阈值 0.3660
+2026-11-23 15:34:53,152 - INFO - 最终测试集性能: Link AUC = 0.8623, PR-AUC = 0.6013, Link F1 = 0.5393（阈值 0.3660，由 val 校准）, Link Acc = 0.8407, Precision = 0.5206, Recall = 0.5594
+2026-11-23 15:34:53,153 - INFO - 参考上界: test 自身最优阈值 F1 = 0.5691 @ 0.3109（阈值已接触测试数据，仅用于诊断阈值漂移，不作为正式指标）
+2026-11-23 15:34:53,154 - INFO - ==== 全候选排序评估（未标注位点按负例，绝对值偏保守，用于相对比较）====
+2026-11-23 15:34:53,589 - INFO - [全候选/val] 激酶 90/90 | 正边 2935 | 候选位点 11123
+2026-11-23 15:34:53,591 - INFO - [全候选/val] AP: 宏平均 0.1193 | 按正边加权 0.1448 | 池化 0.0497
+2026-11-23 15:34:53,593 - INFO - [全候选/val] Recall(加权/宏) @10 0.029(宏 0.120) / @20 0.044(宏 0.141) / @50 0.083(宏 0.185) / @100 0.129(宏 0.230) | MRR 池化 0.0158/加权 0.0158/宏 0.0717 | 正例池化中位秩 743
+2026-11-23 15:34:53,595 - INFO - [全候选/val] Hits@K（激酶命中率）@1 0.167 / @10 0.422 / @20 0.444
+2026-11-23 15:34:53,597 - INFO - [全候选/val] 分层 n_pos=1-5: 激酶 41, 正边 98, AP 宏 0.1396/加权 0.1131, Recall@50 加权 0.1735
+2026-11-23 15:34:53,598 - INFO - [全候选/val] 分层 n_pos=6-20: 激酶 29, 正边 302, AP 宏 0.0905/加权 0.0823, Recall@50 加权 0.1954
+2026-11-23 15:34:53,599 - INFO - [全候选/val] 分层 n_pos=21-50: 激酶 4, 正边 140, AP 宏 0.0984/加权 0.0958, Recall@50 加权 0.1714
+2026-11-23 15:34:53,600 - INFO - [全候选/val] 分层 n_pos=>50: 激酶 16, 正边 2395, AP 宏 0.1249/加权 0.1568, Recall@50 加权 0.0597
+2026-11-23 15:34:53,605 - INFO - [全候选/val] 家族拖累 Top3（按加权 AP）: BRD=0.000(n_pos=1), DYRK=0.000(n_pos=1), DMPK=0.001(n_pos=3)
+2026-11-23 15:34:53,840 - INFO - [全候选/test] 激酶 46/46 | 正边 1680 | 候选位点 11123
+2026-11-23 15:34:53,841 - INFO - [全候选/test] AP: 宏平均 0.0602 | 按正边加权 0.2422 | 池化 0.0370
+2026-11-23 15:34:53,841 - INFO - [全候选/test] Recall(加权/宏) @10 0.025(宏 0.044) / @20 0.046(宏 0.072) / @50 0.090(宏 0.146) / @100 0.136(宏 0.185) | MRR 池化 0.0134/加权 0.0134/宏 0.0220 | 正例池化中位秩 924
+2026-11-23 15:34:53,842 - INFO - [全候选/test] Hits@K（激酶命中率）@1 0.152 / @10 0.304 / @20 0.348
+2026-11-23 15:34:53,843 - INFO - [全候选/test] 分层 n_pos=1-5: 激酶 20, 正边 45, AP 宏 0.0236/加权 0.0313, Recall@50 加权 0.1333
+2026-11-23 15:34:53,843 - INFO - [全候选/test] 分层 n_pos=6-20: 激酶 15, 正边 150, AP 宏 0.0517/加权 0.0535, Recall@50 加权 0.1933
+2026-11-23 15:34:53,844 - INFO - [全候选/test] 分层 n_pos=21-50: 激酶 4, 正边 136, AP 宏 0.1303/加权 0.0870, Recall@50 加权 0.1250
+2026-11-23 15:34:53,845 - INFO - [全候选/test] 分层 n_pos=>50: 激酶 7, 正边 1349, AP 宏 0.1434/加权 0.2858, Recall@50 加权 0.0734
+2026-11-23 15:34:53,848 - INFO - [全候选/test] 家族拖累 Top3（按加权 AP）: TAF1=0.001(n_pos=6), CDK=0.001(n_pos=1), CAMK2=0.001(n_pos=5)
+2026-11-23 15:34:53,849 - INFO - 全候选汇总: test Macro-AP = 0.0602, 加权AP = 0.2422, 池化AP = 0.0370, MRR = 0.0134, 正例中位秩 = 924
