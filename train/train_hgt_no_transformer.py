@@ -14,10 +14,12 @@ DEGREE_ALPHA=0.5，其余数据划分、随机种子、损失函数及训练超�
 负采样：对正样本做单侧破坏（默认保留激酶替换位点），并以全量正边索引过滤，
   避免把未标注的真实边（尤其暗激酶的边）当作负样本。
 评估口径（两套并列，不可互相替代）：
-  1) 随机 1:5 负采样 PR-AUC —— "能否区分少量随机负样本"，用于模型选择；
+  1) 随机 1:5 负采样 PR-AUC —— "能否区分少量随机负样本"（监控口径）；
   2) A1 全候选排序（FULL_RANK_EVAL）—— 每个激酶在**全部位点**上排序，报告
      Recall@K / Precision@K / Hits@K / MRR / 正例中位秩 / full AP，并按已知底物数
      与家族分层；未标注位点按负例处理，绝对值偏保守，用于衡量真实候选可发现性。
+模型选择 / 早停（MODEL_SELECT_METRIC）：默认取全候选排序 val Macro-AP（口径 2），
+  与真实用途对齐；'pr_auc' 回退旧的 1:5 口径作对照。
 """
 
 from collections import defaultdict
@@ -112,10 +114,17 @@ RETRIEVAL_CONF_TEMP = 0.04        # 置信度温度（越小开关越陡）
 FULL_RANK_EVAL = True             # 是否启用全候选排序指标
 FULL_RANK_KS = (10, 20, 50, 100)  # Recall@K 的 K 列表
 FULL_RANK_HIT_KS = (1, 10, 20)    # Hits@K：top-K 内至少命中一个真实底物的激酶比例
-FULL_RANK_EVERY = 25              # 训练期每隔多少 epoch 在 val 上算一次（0=训练期不算，只算最终）
+FULL_RANK_EVERY = 25              # 降频监控间隔（仅选模指标不是全候选时生效；选模用全候选时每次评估都算，此参数忽略）
 FULL_RANK_MAX_KINASES = 0         # 训练期监控最多评估的激酶数（0=全部；最终评估恒为全部）
 FULL_RANK_SITE_CHUNK = 8192       # 位点分块大小，控制显存
 FULL_RANK_OUT_DIR = str(PROJECT_ROOT / "analysis/full_rank")  # 逐激酶/家族/分层结果输出目录
+# ---- 模型选择 / 早停指标 ----
+# 'full_rank_ap': 全候选排序 val Macro-AP——逐激酶 full AP 的宏平均（未标注位点按负例，
+#                 绝对值偏低但与自身历史可比），对齐真实用途"候选可发现性"；
+# 'pr_auc': 旧的 1:5 随机负采样 val PR-AUC（对照）。
+# 选 full_rank_ap 时每次评估（EVAL_EVERY）都计算全候选排序（val 90 激酶，实测 <1s/次，
+# FULL_RANK_EVERY 降频被忽略）；早停 patience 语义不变（仍按评估事件计数）。
+MODEL_SELECT_METRIC = 'full_rank_ap'
 LEARNING_RATE = 9e-5
 # 门控/偏置等标定参数单独参数组：它们从 0（或极小值）起步且是整项先验的乘子，
 # Adam 在 lr=9e-5、6 步/epoch 下累计最大位移只有约 0.29，门控会"走不动"，
@@ -1131,7 +1140,8 @@ def _format_full_rank_short(fr, split_name='val'):
 # ==================== 主程序 ====================
 def main():
     attach_file_logging('train_no_transformer')
-    logging.info("实验：无 Transformer + 原始静态 ESM 检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边")
+    logging.info("实验：无 Transformer + 原始静态 ESM 检索谱；DEGREE_ALPHA=0.5，保留 ESM similar_to 图边"
+                 f"；选模指标={MODEL_SELECT_METRIC}")
     logging.info(f"独立 checkpoint: {CKPT_PATH}")
     # 1. 加载图数据
     logging.info("加载异构图...")
@@ -1295,7 +1305,7 @@ def main():
     )
     
     # 7. 训练循环
-    best_val_auc = 0.0
+    best_val_select = 0.0   # 选模指标当前最优值（口径由 MODEL_SELECT_METRIC 决定）
     patience_counter = 0
     
     # 准备掩码字典和边字典供评估使用
@@ -1387,21 +1397,33 @@ def main():
                 f"标定: {format_calib(model)}"
             )
 
-            # A1: 全候选排序监控（训练期只算 val，按 FULL_RANK_EVERY 降频，避免拖慢训练）
-            if FULL_RANK_EVAL and FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0:
+            # A1: 全候选排序（val）。选模指标为 full_rank_ap 时每次评估都算（兼作早停信号）；
+            # 否则按 FULL_RANK_EVERY 降频，仅作监控
+            fr_val = None
+            select_is_fr = MODEL_SELECT_METRIC == 'full_rank_ap'
+            if select_is_fr or (FULL_RANK_EVAL and FULL_RANK_EVERY > 0 and epoch % FULL_RANK_EVERY == 0):
                 fr_val = evaluate_full_candidate_ranking(
                     model, train_data, val_edge_index, num_site,
                     kinase_labels=kinase_labels, family_names=family_names,
                     kinase_names=kinase_names, max_kinases=FULL_RANK_MAX_KINASES,
                     split_name='val', save_csv=False, verbose=False,
                 )
-                logging.info(f"  [全候选/val] {_format_full_rank_short(fr_val)}")
+                logging.info(f"  [全候选/val] {_format_full_rank_short(fr_val)}"
+                             + ("（选模指标）" if select_is_fr else ""))
 
-            if val_pr_auc > best_val_auc:
-                best_val_auc = val_pr_auc
+            # 模型选择 / 早停：按 MODEL_SELECT_METRIC 取值（全候选 val Macro-AP 或 1:5 PR-AUC）
+            if select_is_fr:
+                val_select = fr_val['macro_ap'] if fr_val else -1.0   # 空 split 视为不改善，不存 checkpoint
+            else:
+                val_select = val_pr_auc
+            if val_select > best_val_select:
+                best_val_select = val_select
                 patience_counter = 0
                 save_checkpoint(model)
-                logging.info(f"  -> 保存最佳模型 (Val PR-AUC = {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})")
+                logging.info(
+                    f"  -> 保存最佳模型 (Val {'全候选 Macro-AP' if select_is_fr else 'PR-AUC'} = {val_select:.4f} | "
+                    f"Val PR-AUC = {val_pr_auc:.4f}, Val F1* = {results['val_f1_cal']:.4f} @ thr {results['val_thr_cal']:.3f})"
+                )
             else:
                 patience_counter += 1
                 if patience_counter >= EARLY_STOPPING_PATIENCE:
@@ -1409,7 +1431,8 @@ def main():
                     break
     
     # 加载最佳模型并在测试集上评估
-    logging.info(f"训练完成，最佳验证集 PR-AUC: {best_val_auc:.4f}")
+    _select_name = '全候选 Macro-AP' if MODEL_SELECT_METRIC == 'full_rank_ap' else '1:5 PR-AUC'
+    logging.info(f"训练完成，最佳验证集（选模口径 {_select_name}）: {best_val_select:.4f}")
     model.load_state_dict(load_checkpoint())
     # 阈值校准：L4/难负样本压缩了 logit 量纲，0.5 不再对应判别边界（F1 会塌到 0）；
     # 在 val 固定样本上选最优 F1 阈值，测试集用同一阈值报告（阈值不接触测试数据）
