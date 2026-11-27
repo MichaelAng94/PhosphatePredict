@@ -59,6 +59,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.hgt_transformer import HGTTransformer
+from data_prep.kinase_names import KinaseNamer, load_family_table
 
 
 class HGTTransformerNoTransformer(HGTTransformer):
@@ -133,7 +134,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # 默认使用带 ESMC 窗口嵌入的图（data_prep/add_esmc_features.py 生成）；
 # 无 ESMC 的旧图 joint_hetero_graph_motif.pt 保留为备份
 GRAPH_PATH = str(PROJECT_ROOT / "origin_data/joint_hetero_graph_motif.pt")
-KINASE_FAMILY_FILE = str(PROJECT_ROOT / "origin_data/kinase_family.xls")   # 列名: Name, Family
+KINASE_FAMILY_FILE = str(PROJECT_ROOT / "origin_data/kinase_family.csv")   # 规范名 + Manning 分类（data_prep/build_kinase_alias_map.py 生成）
 
 LINK_PRED_BATCH_SIZE = 2000      # 每次采样多少正样本对
 NUM_NEG_SAMPLES = 5               # 每个正样本对应的负样本数（1:1 会高估 PR-AUC）
@@ -321,13 +322,14 @@ def load_kinase_family_labels(kinase_nodes, family_file, return_names=False):
         num_classes: int
         family_names: list[str]（仅 return_names=True 时）
     """
-    df = pd.read_excel(family_file)
+    df = load_family_table(family_file)   # 新表 kinase_family.csv（规范名）；兼容旧 xls
     # 归一化激酶名称（与构建图时一致：大写，不删数字）
     df['Kinase_norm'] = df['Name'].astype(str).str.strip().str.upper()
-    # 构建映射
+    # 构建映射（无家族分类的激酶不写入，保持无标签）
     label_map = {}
     for _, row in df.iterrows():
-        label_map[row['Kinase_norm']] = row['Family']
+        if str(row['Family']).strip():
+            label_map[row['Kinase_norm']] = row['Family']
     # 编码家族名称
     families = sorted(set(label_map.values()))
     le = LabelEncoder()
@@ -1322,7 +1324,10 @@ def main():
         )
         # 诊断：A 类（预期低 conf）与 C 类（预期高 conf）抽查——验证调制方向
         _kname_list = list(kinase_names)
-        _diag = [n for n in ('TAF1', 'RON', 'PKM', 'CHAK2', 'LKB1', 'VRK1', 'AURC', 'P38D', 'EGFR', 'TTK')
+        # 图节点是规范名：抽查名单里的旧名经别名表换成规范名（RON->MST1R、P38D->MAPK13…）
+        _namer = KinaseNamer.load()
+        _diag = [n for n in dict.fromkeys(_namer.canonical(x) for x in
+                 ('TAF1', 'RON', 'PKM', 'CHAK2', 'LKB1', 'VRK1', 'AURC', 'P38D', 'EGFR', 'TTK'))
                  if n in _kname_list]
         logging.info("R1.1 conf 诊断: " + ", ".join(
             f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))

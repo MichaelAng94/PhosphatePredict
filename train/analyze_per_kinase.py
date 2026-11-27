@@ -30,6 +30,7 @@ from train_hgt_trans import (
     select_best_f1_threshold,
 )
 from model.hgt_transformer import HGTTransformer
+from data_prep.kinase_names import load_family_table
 
 
 def parse_args():
@@ -44,10 +45,10 @@ def parse_args():
 
 def load_family_names(kinase_names):
     """返回与图节点对齐的家族名字符串；无标签记为 UNLABELED。"""
-    df = pd.read_excel(KINASE_FAMILY_FILE)
+    df = load_family_table(KINASE_FAMILY_FILE)   # kinase_family.csv（规范名）；兼容旧 xls
     mapping = {
         str(row['Name']).strip().upper(): str(row['Family']).strip()
-        for _, row in df.iterrows()
+        for _, row in df.iterrows() if str(row['Family']).strip()
     }
     return np.array([mapping.get(str(k).strip().upper(), 'UNLABELED') for k in kinase_names])
 
