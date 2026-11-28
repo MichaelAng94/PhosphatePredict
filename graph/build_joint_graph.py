@@ -4,8 +4,12 @@
 构建联合异构图：同时包含激酶-激酶 PPI 边和激酶-底物磷酸化边。
 激酶节点名 = HGNC 现用基因符号：KSR / PPI / ESM 特征里的原始名经别名表归一
 （data_prep/build_kinase_alias_map.py 生成），同一激酶的旧名与现用名
-（CDC2 与 CDK1、FRAP 与 MTOR…）合并为一个节点；泛称（PKA、MAPK…）、非蛋白激酶、
-非人物种名、融合蛋白名无法归属到具体激酶，不进图。
+（CDC2 与 CDK1、FRAP 与 MTOR…）合并为一个节点。
+KSR 里无法归属到某个具体激酶的注释也尽量保留，用边层级 edge_level 区分（见 data_prep/edge_levels.py）：
+  0  特定激酶的注释
+  1  家族层面注释（PKA_GROUP、CAMKII…）：挂到 FAMILY_<家族> 节点上，特征取成员特征的质心，只用于训练
+  2  自磷酸化（AUTOCATALYSIS）：按底物蛋白反推出激酶，只用于训练
+仍然不进图的只有：非蛋白激酶、融合蛋白 / 注释文字、没有成员定义的泛称、反推不出激酶的自磷酸化。
 只保留有 ESM 特征或 Node2Vec 特征的激酶节点以及有特征的底物节点。
 输出：origin_data/joint_hetero_graph.pt
 """
@@ -27,13 +31,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data_prep.kinase_names import ALIAS_MAP_PATH, EXCLUDED_ENTITY_TYPES, KinaseNamer
+from data_prep.kinase_names import ALIAS_MAP_PATH, EXCLUDED_ENTITY_TYPES, FAMILY_PREFIX, KinaseNamer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==================== 配置路径 ====================
 PPI_CSV = str(PROJECT_ROOT / "PPI/kinase_ppi_network.csv")                      # 激酶-激酶 PPI
 KINASE_SUBSTRATE_CSV = str(PROJECT_ROOT / "origin_data/kinase_substrate_pairs_detailed.csv")  # 激酶-底物关系
+# 自磷酸化位点 -> 激酶（build_kinase_alias_map.py 按底物的 UniProt 反推生成）
+AUTOPHOS_MAP_CSV = str(PROJECT_ROOT / "origin_data/kinase_autophos_map.csv")
 SITE_FEATURE_DIR = str(PROJECT_ROOT / "origin_data/substate")                   # 底物位点特征目录
 KINASE_FEATURE_DIRS = [str(PROJECT_ROOT / "origin_data/kinase"), str(PROJECT_ROOT / "origin_data/kinase/out")]  # 激酶特征目录（ESM）
 # 激酶序列 FASTA（三者名字不重叠），用于判定特征文件名字的命名语义，以及同一规范名有多个
@@ -67,8 +73,8 @@ def normalize_kinase_name(raw_name: str) -> str:
     return raw_name.strip().upper()
 
 def canonical_kinase_name(raw_name: str, semantics: str = 'kinbase') -> str:
-    """原始名 -> 规范名（HGNC 现用符号）。
-    泛称 / 非蛋白激酶 / 非人物种 / 融合蛋白等无法归属到具体激酶的名字返回空串（不进图）。
+    """原始名 -> 规范名（HGNC 现用符号）；用于 PPI 表与 ESM 特征文件的名字（KSR 表走 classify_kinase_rows）。
+    非蛋白激酶、融合蛋白 / 注释文字等不进图的类型返回空串。
     semantics: KSR 表与 KinBase 命名的序列名用 'kinbase'；STRING 的 preferredName 与 UniProt 按基因名
     检索得到的序列名用 'symbol'——同一个字符串在两种命名里可能是不同的蛋白（GCK、MST1、PDK1…）。"""
     name, etype = NAMER.info(raw_name, semantics=semantics)
@@ -99,6 +105,39 @@ def _feature_rank(raw_name: str, canonical: str) -> tuple:
         if name in names:
             return (1, rank, name)
     return (1, len(_FASTA_NAMES) + 1, name)
+
+
+def load_autophos_map(path: str) -> dict:
+    """{位点 id: 激酶规范名}。文件不存在时返回空字典（此时自磷酸化的行全部不进图）。"""
+    if not os.path.exists(path):
+        logging.warning(f"找不到自磷酸化对照表 {path}，AUTOCATALYSIS 的行不会进图；"
+                        f"先运行 python3 data_prep/build_kinase_alias_map.py 生成")
+        return {}
+    df = pd.read_csv(path, dtype=str).fillna("")
+    return dict(zip(df['site_id'], df['kinase']))
+
+
+# 边层级（与 data_prep/edge_levels.py 一致）
+LEVEL_SPECIFIC, LEVEL_FAMILY, LEVEL_AUTOPHOS = 0, 1, 2
+
+def classify_kinase_rows(df_ks, autophos: dict):
+    """给 KSR 的每一行确定图中的激酶节点与边层级。返回 (节点列表, 层级列表)：
+        LEVEL_SPECIFIC  特定激酶的注释（未解析的旧名按原名成节点，与以前一致）
+        LEVEL_FAMILY    家族层面注释，节点是 FAMILY_xxx（特征取成员质心，只用于训练）
+        LEVEL_AUTOPHOS  自磷酸化，激酶由底物位点查 autophos 反推（只用于训练）
+    节点为空串表示不进图：没有家族定义的泛称、非蛋白激酶、融合蛋白 / 注释文字、反推不出激酶的自磷酸化。"""
+    nodes, levels = [], []
+    for name, site in zip(df_ks['Kinase'], df_ks['site_id']):
+        node, etype = NAMER.info(name)
+        if etype == 'autocatalysis':
+            node, level = autophos.get(site, ''), LEVEL_AUTOPHOS
+        elif etype == 'group':
+            node, level = (node if NAMER.is_family_node(node) else ''), LEVEL_FAMILY
+        else:
+            node, level = ('' if etype in EXCLUDED_ENTITY_TYPES else node), LEVEL_SPECIFIC
+        nodes.append(node)
+        levels.append(level)
+    return nodes, levels
 
 def load_kinase_features_esm():
     """返回字典 {规范激酶名: ESM特征张量}。.npy 按原始名存储，这里经别名表归一；
@@ -244,17 +283,25 @@ def build_joint_graph():
     # 加载底物特征（不变）
     site_feat = load_site_features()
     
-    # 读取激酶-底物关系，激酶名归一为规范名（泛称/非蛋白激酶/非人物种/融合名的行剔除）
+    # 读取激酶-底物关系，确定每一行的图节点与边层级（见 classify_kinase_rows）
     df_ks = pd.read_csv(KINASE_SUBSTRATE_CSV)
     df_ks['Kinase_raw'] = df_ks['Kinase'].astype(str).apply(normalize_kinase_name)
-    df_ks['Kinase_norm'] = df_ks['Kinase'].apply(canonical_kinase_name)
+    df_ks['site_id'] = df_ks['EPSD_ID'] + '_' + df_ks['Position'].astype(str)
+    nodes, levels = classify_kinase_rows(df_ks, load_autophos_map(AUTOPHOS_MAP_CSV))
+    df_ks['Kinase_norm'], df_ks['level'] = nodes, levels
     excluded = df_ks.loc[df_ks['Kinase_norm'] == '', 'Kinase_raw'].value_counts()
     if len(excluded):
-        logging.info(f"激酶名归一：剔除 {int(excluded.sum())} 行 KSR（{len(excluded)} 个名字无法归属到具体激酶）: "
-                     + ", ".join(f"{k}({v})" for k, v in excluded.head(20).items())
-                     + ("…" if len(excluded) > 20 else ""))
-    df_ks = df_ks[df_ks['Kinase_norm'] != ''].reset_index(drop=True)
-    all_kinases_from_ks = set(df_ks['Kinase_norm'].unique())
+        logging.info(f"KSR 行归属: 剔除 {int(excluded.sum())} 行（{len(excluded)} 个名字——非蛋白激酶、融合蛋白 / "
+                     f"注释文字、没有家族定义的泛称、反推不出激酶的自磷酸化）: "
+                     + ", ".join(f"{k}({v})" for k, v in excluded.head(15).items())
+                     + ("…" if len(excluded) > 15 else ""))
+    used = df_ks[df_ks['Kinase_norm'] != ''].reset_index(drop=True)
+    logging.info("KSR 行归属（保留）: " + "，".join(
+        f"{name} {int((used['level'] == lv).sum())} 行" for lv, name in
+        ((LEVEL_SPECIFIC, "特定激酶的注释"), (LEVEL_FAMILY, "家族层面注释"), (LEVEL_AUTOPHOS, "自磷酸化"))))
+    family_defs = NAMER.family_nodes()
+    all_kinases_from_ks = set(used['Kinase_norm'].unique())
+    real_kinases_from_ks = all_kinases_from_ks - set(family_defs)
     
     # 读取 PPI 边，获取所有激酶（规范名）。STRING 的 preferredName 是现用符号语义
     df_ppi = pd.read_csv(PPI_CSV)
@@ -265,8 +312,8 @@ def build_joint_graph():
     df_ppi = df_ppi[(df_ppi['Kinase_A_norm'] != '') & (df_ppi['Kinase_B_norm'] != '')].reset_index(drop=True)
     all_kinases_from_ppi = set(df_ppi['Kinase_A_norm']) | set(df_ppi['Kinase_B_norm'])
     
-    # 候选激酶节点 = 出现在关系或 PPI 中的激酶
-    candidate_kinases = all_kinases_from_ks | all_kinases_from_ppi
+    # 候选激酶节点 = 出现在关系或 PPI 中的激酶（家族节点在成员特征确定之后再建）
+    candidate_kinases = real_kinases_from_ks | all_kinases_from_ppi
     
     # 分离：有 ESM 的和没有 ESM 的
     kinases_with_esm = candidate_kinases & set(kinase_esm.keys())
@@ -285,13 +332,27 @@ def build_joint_graph():
         if k in kinase_n2v:
             kinase_feat[k] = kinase_n2v[k]
     logging.info(f"总激酶节点数（有特征）: {len(kinase_feat)}")
+
+    # 家族节点：承接家族层面的注释，特征取成员特征的质心；没有任何成员有特征的家族节点不进图
+    family_feat = {}
+    for f in sorted(all_kinases_from_ks):
+        if f in family_defs:
+            members = [m for m in family_defs[f] if m in kinase_feat]
+            if members:
+                family_feat[f] = members
+                kinase_feat[f] = None                 # 节点是否存在只看键；特征在下面按成员求均值
+    logging.info(f"家族节点 {len(family_feat)} 个（FAMILY_xxx，只用于训练）")
     
     # 过滤关系边：只保留激酶在 kinase_feat 中且底物在 site_feat 中的行；
     # 别名合并后同一 (激酶, 位点) 会重复出现（CDC2 与 CDK1 的重叠边、跨库重复条目），去重
-    df_ks['site_id'] = df_ks['EPSD_ID'] + '_' + df_ks['Position'].astype(str)
-    mask_ks = df_ks['Kinase_norm'].isin(kinase_feat.keys()) & df_ks['site_id'].isin(site_feat.keys())
-    df_ks_filtered = df_ks[mask_ks].drop_duplicates(['Kinase_norm', 'site_id'])
-    logging.info(f"磷酸化边: 入图 {len(df_ks_filtered)} 条（去重前 {int(mask_ks.sum())} 条）")
+    mask_ks = used['Kinase_norm'].isin(kinase_feat.keys()) & used['site_id'].isin(site_feat.keys())
+    # 同一 (激酶, 位点) 会重复出现（别名合并后的重叠边、跨库重复条目、自磷酸化与特异注释并存）：
+    # 按层级排序后去重，保留 level 最小的那条（特异注释优先于家族层面 / 自磷酸化）
+    df_ks_filtered = used[mask_ks].sort_values('level', kind='stable').drop_duplicates(['Kinase_norm', 'site_id'])
+    n_lv = df_ks_filtered['level'].value_counts()
+    logging.info(f"磷酸化边: 入图 {len(df_ks_filtered)} 条（去重前 {int(mask_ks.sum())} 条）—— "
+                 f"特定激酶 {int(n_lv.get(LEVEL_SPECIFIC, 0))}，家族层面 {int(n_lv.get(LEVEL_FAMILY, 0))}，"
+                 f"自磷酸化 {int(n_lv.get(LEVEL_AUTOPHOS, 0))}")
     
     # 过滤 PPI 边：只保留两端激酶都在 kinase_feat 中的边
     mask_ppi = df_ppi['Kinase_A_norm'].isin(kinase_feat.keys()) & df_ppi['Kinase_B_norm'].isin(kinase_feat.keys())
@@ -317,6 +378,21 @@ def build_joint_graph():
             esm_x[i] = kinase_esm[k]
         if k in kinase_n2v:
             n2v_x[i] = kinase_n2v[k]
+
+    # 家族节点特征 = 成员特征均值（ESM、Node2Vec 各自对有该特征的成员求均值）；
+    # family_members 记录每个家族节点的成员下标，训练脚本据此做负样本过滤与评估屏蔽
+    family_members = [[] for _ in all_kinases]
+    for i, k in enumerate(all_kinases):
+        if k not in family_feat:
+            continue
+        ms = family_feat[k]
+        family_members[i] = [kinase_to_idx[m] for m in ms]
+        e = [kinase_esm[m] for m in ms if m in kinase_esm]
+        if esm_x is not None and e:
+            esm_x[i] = torch.tensor(np.mean(e, axis=0), dtype=torch.float)
+        n = [kinase_n2v[m] for m in ms if m in kinase_n2v]
+        if n:
+            n2v_x[i] = torch.tensor(np.mean(n, axis=0), dtype=torch.float)
     
     # 底物节点集合来自过滤后的关系（节点集仍由窗口特征目录定义，保证图结构与历史一致）
     all_sites = sorted(df_ks_filtered['site_id'].unique())
@@ -354,6 +430,7 @@ def build_joint_graph():
         v = site_to_idx[row['site_id']]
         edge_ks.append([u, v])
     edge_ks = torch.tensor(edge_ks, dtype=torch.long).t().contiguous()
+    edge_level = torch.tensor(df_ks_filtered['level'].tolist(), dtype=torch.long)   # 与 edge_ks 同序
     
     # 构建 PPI 双向边：复用前面已按规范名过滤的 df_ppi_filtered；
     # 别名合并后不同行可能落到同一对节点，按无序对去重
@@ -371,18 +448,28 @@ def build_joint_graph():
     data['kinase', 'phosphorylates', 'site'].edge_index = edge_ks
     data['site', 'rev_phosphorylates', 'kinase'].edge_index = edge_ks[[1, 0], :]
     data['kinase', 'ppis', 'kinase'].edge_index = edge_ppi
+    # 边层级与家族节点标注（反向边与正向边同序）：训练脚本经 data_prep/edge_levels.py 读取
+    data['kinase', 'phosphorylates', 'site'].edge_level = edge_level
+    data['site', 'rev_phosphorylates', 'kinase'].edge_level = edge_level
     
     # 保存节点名称
     data['kinase'].node_names = all_kinases
     data['site'].node_names = all_sites
+    data['kinase'].is_family = torch.tensor([k in family_feat for k in all_kinases], dtype=torch.bool)
+    data['kinase'].family_members = family_members
     
     # 9. 保存
     torch.save(data, OUTPUT_GRAPH)
     logging.info(f"联合异构图已保存至 {OUTPUT_GRAPH}")
     logging.info(f"图结构:\n{data}")
-    merged = {k: NAMER.aliases(k) for k in all_kinases if len(NAMER.aliases(k)) > 1}
-    logging.info(f"激酶节点 {len(all_kinases)} 个，其中由多个名字合并而成的 {len(merged)} 个: "
+    merged = {k: NAMER.aliases(k) for k in all_kinases
+              if k not in family_feat and len(NAMER.aliases(k)) > 1}
+    logging.info(f"激酶节点 {len(all_kinases)} 个（其中家族节点 {len(family_feat)} 个），"
+                 f"由多个名字合并而成的 {len(merged)} 个: "
                  + ", ".join(f"{k}<-{'/'.join(v for v in names if v != k)}" for k, names in sorted(merged.items())))
+    fam_edges = df_ks_filtered[df_ks_filtered['level'] == LEVEL_FAMILY].groupby('Kinase_norm').size()
+    logging.info("家族节点及其边数: " + ", ".join(
+        f"{k}[{'/'.join(family_feat[k])}]x{int(fam_edges.get(k, 0))}" for k in sorted(family_feat)))
     
     return data
 

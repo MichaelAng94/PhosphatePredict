@@ -14,6 +14,7 @@
 """
 
 import os
+import sys
 import time
 from collections import defaultdict
 
@@ -22,6 +23,13 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 from sklearn.metrics import average_precision_score
+
+# 项目根目录入 sys.path，保证本模块被任意脚本导入或直接运行时都能找到 data_prep
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from data_prep.edge_levels import mask_family_sites, masked_sites
 
 DEFAULT_RANK_KS = (10, 20, 50, 100)   # Recall@K 的 K 列表
 DEFAULT_HIT_KS = (1, 10, 20)          # Hits@K：top-K 内至少命中一个真实底物的激酶比例
@@ -66,7 +74,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
                                     site_chunk=DEFAULT_SITE_CHUNK,
                                     split_name='test', save_csv=False,
                                     out_dir=DEFAULT_OUT_DIR, date_tag=None,
-                                    verbose=True):
+                                    verbose=True, mask_sites=None):
     """返回：标量汇总指标 dict（逐激酶明细见 CSV）。参数同 no_transformer 脚本内版本。"""
     import logging
 
@@ -97,10 +105,14 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
         rows = []
         pooled_scores, pooled_labels, pooled_ranks = [], [], []
         for k_id, site_set in tqdm(items, desc=f'全候选排序[{split_name}]', leave=False):
-            scores = score_kinase_all_sites(
+            raw_scores = score_kinase_all_sites(
                 model, kinase_emb, site_emb, k_id, num_site,
                 fam_probs=fam_probs, site_chunk=site_chunk
-            ).cpu().numpy()
+            )
+            # 该激酶所属家族的家族层面注释位点移出候选（分数置 -inf，排到最后）；自身的特异正例不屏蔽
+            n_masked = mask_family_sites(
+                raw_scores, list(site_set), masked_sites(mask_sites, k_id))
+            scores = raw_scores.cpu().numpy()
             # 一次性排出全部位点名次（1 为最高分）；并列按稳定排序处理
             order = np.argsort(-scores, kind='stable')
             rank = np.empty(num_site, dtype=np.int64)
@@ -124,7 +136,7 @@ def evaluate_full_candidate_ranking(model, embed_data, edge_index, num_site,
 
             row = {
                 'kinase_id': int(k_id), 'kinase': k_name, 'family': fam_name,
-                'family_id': fam_id, 'n_pos': n_pos, 'n_site': num_site,
+                'family_id': fam_id, 'n_pos': n_pos, 'n_site': num_site - n_masked,
                 'full_ap': ap,
                 'mrr': float(np.mean(1.0 / pos_ranks)),
                 'median_rank': float(np.median(pos_ranks)),

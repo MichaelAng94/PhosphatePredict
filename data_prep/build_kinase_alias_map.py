@@ -14,7 +14,7 @@ PKACA 与 PRKACA…），只做大写归一会把同一个蛋白拆成多个节�
     注意：HGNC 基因分组里没有覆盖全部蛋白激酶的总组，所以"是不是蛋白激酶"只认 Manning
     映射结果 + 人工对照表。Manning 名恰好等于另一个蛋白的现用符号的情况（PDK1、GCK、
     MYT1、PKD1、MST1、ACTR2、OSR1、SRM）靠人工对照表纠正。
-(2) 原始名 -> 规范名，按证据强度依次尝试：
+(2) 原始名 -> 规范名，按证据强度依次尝试（带物种后缀的名字先去掉后缀，按人源同源基因处理）：
       0 人工对照表 kinase_alias_manual.csv
       1 现用符号 / 2 旧符号 / 3 别名（别名命中多个基因且只有一个是激酶时取该激酶）
       4 '名(符号)'、'名 ISO2'、'名/别名' 等 Phospho.ELM 写法
@@ -25,18 +25,22 @@ PKACA 与 PRKACA…），只做大写归一会把同一个蛋白拆成多个节�
       9 UniProt accession 一致（fetch_report.csv 对 HGNC uniprot_ids）
       10 与已解析名字的激酶序列完全相同
 
-实体类型：kinase / group / non_kinase / non_human / other / ambiguous / unmapped。
-  kinase      具体的人蛋白激酶
-  group       家族/泛称（PKA、MAPK、XX_GROUP… 的注释无法归属到某一个激酶）
-  non_kinase  能对应到基因但不是蛋白激酶（GUK1、PRKAR2A、PKM、CK2B…）
-  non_human   带非人物种后缀（_BOVIN、_DROME…）
-  other       融合蛋白、自磷酸化、注释文字等
-  ambiguous   别名同时命中多个不同家族的激酶
-  unmapped    以上都解析不到
+实体类型：kinase / group / autocatalysis / non_kinase / other / ambiguous / unmapped。
+  kinase        具体的人蛋白激酶
+  group         家族/泛称（PKA_GROUP、MAPK… 的注释只说明"该家族的某个成员"）。在
+                kinase_family_groups.csv 里定义了成员的家族会有一个 FAMILY_<家族> 节点来承接
+                这些边（只用于训练，见 data_prep/edge_levels.py）；没有定义的不进图。
+  autocatalysis 自磷酸化：激酶就是底物蛋白自身。按底物的 UniProt 反推到具体激酶，写入
+                kinase_autophos_map.csv；反推不出（底物不是蛋白激酶）的不进图。
+  non_kinase    能对应到基因但不是蛋白激酶（GUK1、PKM、PIK3CA…）
+  other         融合蛋白、注释文字等
+  ambiguous     别名同时命中多个不同家族的激酶
+  unmapped      以上都解析不到
 
 输入（origin_data/）：HGNC 完整表、kinase_family.xls（Manning 2002）、kinase_alias_manual.csv、
-三个激酶序列 FASTA、fetch_report.csv、kinase_substrate_pairs_detailed.csv，以及 PPI 表。
-输出：origin_data/kinase_alias_map.csv、origin_data/kinase_family.csv
+kinase_family_groups.csv、三个激酶序列 FASTA、fetch_report.csv、kinase_substrate_pairs_detailed.csv，
+以及 PPI 表。
+输出：origin_data/kinase_alias_map.csv、origin_data/kinase_family.csv、origin_data/kinase_autophos_map.csv
 
 用法（项目根目录）:
     python3 data_prep/build_kinase_alias_map.py [--hgnc <HGNC 表>] [--out-alias <csv>] [--out-family <csv>]
@@ -47,16 +51,23 @@ HGNC 完整表（约 16 MB）下载:
 
 import argparse
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from data_prep.kinase_names import FAMILY_PREFIX
+
 DATA = PROJECT_ROOT / "origin_data"
 HGNC_DEFAULT = DATA / "hgnc_complete_set.txt"
 MANNING_XLS = DATA / "kinase_family.xls"
 MANUAL_CSV = DATA / "kinase_alias_manual.csv"   # raw_name, canonical, entity_type, group, family, subfamily, note
+FAMILY_GROUPS_CSV = DATA / "kinase_family_groups.csv"   # group_key, members, note：泛称对应的家族成员
 KSR_CSV = DATA / "kinase_substrate_pairs_detailed.csv"
 PPI_CSV = PROJECT_ROOT / "PPI/kinase_ppi_network.csv"
 FETCH_REPORT = DATA / "fetch_report.csv"
@@ -67,11 +78,11 @@ FASTAS = [DATA / "kinase_sequences.fasta",
 UNIPROT_FASTA = DATA / "kinase_sequences_uniprot.fasta"
 OUT_ALIAS = DATA / "kinase_alias_map.csv"
 OUT_FAMILY = DATA / "kinase_family.csv"
+OUT_AUTOPHOS = DATA / "kinase_autophos_map.csv"
 
-# Swiss-Prot 风格物种码。_HUMAN 去后缀后按人源处理；其余物种不并入人激酶。
-HUMAN_SUFFIX = "HUMAN"
-NONHUMAN_SUFFIXES = {
-    "BOVIN", "MOUSE", "RAT", "RABIT", "RABBIT", "CHICK", "XENLA", "XENLU", "DROME", "CAEEL",
+# Swiss-Prot 风格物种码：带这些后缀的激酶名去掉后缀后按人源同源基因处理。
+SPECIES_SUFFIXES = {
+    "HUMAN", "BOVIN", "MOUSE", "RAT", "RABIT", "RABBIT", "CHICK", "XENLA", "XENLU", "DROME", "CAEEL",
     "SCHPO", "YEAST", "PIG", "SHEEP", "CANFA", "ARATH", "HSV", "HCMV", "SV40", "VACCV", "EBVB",
 }
 SPECIES_RE = re.compile(r"^(.+)_([A-Z0-9]+)$")
@@ -149,7 +160,7 @@ def _read_fasta(paths, with_seq):
 def strip_species(name):
     """返回 (去物种后缀的基础名, 物种码)；无已知物种后缀返回 (name, '')。"""
     m = SPECIES_RE.match(name)
-    if m and m.group(2) in NONHUMAN_SUFFIXES | {HUMAN_SUFFIX}:
+    if m and m.group(2) in SPECIES_SUFFIXES:
         return m.group(1), m.group(2)
     return name, ""
 
@@ -208,6 +219,32 @@ def manual_syms(row) -> set:
     return {x for x in upper(row.canonical).split(";") if x}
 
 
+def read_family_groups(path, kinome, family_of):
+    """泛称对应的家族成员：{group_key: tuple(成员符号…)}。
+    members 列用 ';' 分隔，支持三种宏（按 Manning 分类从家族表展开）：
+    @Family:X（某一家族）、@Group:X（某一大类）、@Prefix:X（符号以 X 开头）。
+    直接写出的成员符号这里原样保留，调用方在激酶组补全之后再做校验。"""
+    df = pd.read_csv(path, dtype=str).fillna("")
+    groups = {}
+    for r in df.itertuples(index=False):
+        key, members = upper(r.group_key), []
+        for tok in (x.strip().upper() for x in str(r.members).split(";") if x.strip()):
+            if tok.startswith("@FAMILY:"):
+                x = tok.split(":", 1)[1]
+                members += sorted(s for s in kinome if family_of[s][1] == x)
+            elif tok.startswith("@GROUP:"):
+                x = tok.split(":", 1)[1]
+                members += sorted(s for s in kinome if family_of[s][0] == x)
+            elif tok.startswith("@PREFIX:"):
+                members += sorted(s for s in kinome if s.startswith(tok.split(":", 1)[1]))
+            else:
+                members.append(tok)
+        if not members:
+            raise ValueError(f"kinase_family_groups.csv 中家族 {key} 没有任何成员")
+        groups[key] = tuple(sorted(set(members)))
+    return groups
+
+
 def resolve_tokens(name, idx, manning_canon) -> set:
     """'HER2/ERBB2'、'PKG1/CGK-I' 这类"名/别名"写法：各段分别解析，返回并集。"""
     syms = set()
@@ -221,8 +258,9 @@ def main():
     ap.add_argument("--hgnc", default=str(HGNC_DEFAULT), help="HGNC hgnc_complete_set.txt 路径")
     ap.add_argument("--out-alias", default=str(OUT_ALIAS), help="别名映射表输出路径")
     ap.add_argument("--out-family", default=str(OUT_FAMILY), help="家族表输出路径")
+    ap.add_argument("--out-autophos", default=str(OUT_AUTOPHOS), help="自磷酸化位点 -> 激酶 的对照表输出路径")
     args = ap.parse_args()
-    out_alias, out_family = Path(args.out_alias), Path(args.out_family)
+    out_alias, out_family, out_autophos = Path(args.out_alias), Path(args.out_family), Path(args.out_autophos)
 
     idx = HgncIndex(read_hgnc(args.hgnc))
     manning = read_manning(MANNING_XLS)
@@ -237,7 +275,7 @@ def main():
             manning["Pseudogene?"], manning["Protein"]):
         name, group, family, sub = upper(name), upper(group), upper(family), upper(sub)
         base, species = strip_species(name)
-        if (not name) or upper(pseudo) == "Y" or (species and species != HUMAN_SUFFIX):
+        if (not name) or upper(pseudo) == "Y" or (species and species != "HUMAN"):
             continue                               # 伪基因 / 非人条目不进人激酶组
         manning_families |= {family} - {""}
         manning_groups |= {group} - {""}
@@ -279,10 +317,25 @@ def main():
     # 人工对照表里带分类的行：补充 Manning 之后才命名 / 未收录的激酶
     for m in manual.values():
         syms, fam = manual_syms(m), upper(m.family)
-        if syms and fam:
+        if syms and fam and upper(m.entity_type).lower() == "kinase":
             for c in syms:
                 kinome.add(c)
                 family_of[c] = (upper(m.group), fam, upper(m.subfamily))
+    # 泛称对应的家族成员（PKA -> PRKACA/PRKACB/PRKACG …）
+    fam_groups = read_family_groups(FAMILY_GROUPS_CSV, kinome, family_of)
+    # 人工表里的泛称如果恰好也是 Manning 条目名（如 PITSLRE），其家族成员继承该条目的分类
+    manning_entry_of = {base: (group, family, sub) for base, group, family, sub, prot in entries}
+    for m in manual.values():
+        key = upper(m.family)
+        if upper(m.entity_type).lower() == "group" and key in fam_groups and key in manning_entry_of:
+            for c in fam_groups[key]:
+                kinome.add(c)
+                family_of.setdefault(c, manning_entry_of[key])
+    # 激酶组补全之后再校验家族成员：不在激酶组里的多半是符号写错，丢弃并提示
+    bad = [f"{key}:{c}" for key, ms in fam_groups.items() for c in ms if c not in kinome]
+    fam_groups = {key: tuple(c for c in ms if c in kinome) for key, ms in fam_groups.items()}
+    if bad:
+        print(f"[提示] kinase_family_groups.csv 中不在激酶组的成员已忽略: {', '.join(bad)}")
 
     # ---------- 原始名来源 ----------
     ks = pd.read_csv(KSR_CSV, dtype=str).fillna("")
@@ -290,6 +343,22 @@ def main():
     ks["S"] = ks["EPSD_ID"].str.strip() + "_" + ks["Position"].str.strip()
     ks_u = ks.drop_duplicates(["K", "S"])
     n_edges = ks_u.groupby("K")["S"].nunique().to_dict()
+
+    # ---------- 自磷酸化：按底物的 UniProt 反推到具体激酶 ----------
+    # "autocatalysis" 的激酶就是底物蛋白自身。底物 UniProt 必须唯一对应激酶组里的一个基因；
+    # 反推不出（底物不是蛋白激酶，或 accession 对应多个基因）的行不进图。
+    auto_names = {r for r, m in manual.items() if upper(m.entity_type).lower() == "autocatalysis"}
+    acc2sym = {}
+    for acc, syms in idx.uniprot.items():
+        hit = syms & kinome
+        if len(hit) == 1:
+            acc2sym[acc] = next(iter(hit))
+    auto_rows = ks_u[ks_u["K"].isin(auto_names)].copy()
+    auto_rows["kinase"] = (auto_rows["UniProt"].str.strip().str.split("-").str[0].str.upper()
+                           .map(acc2sym).fillna(""))
+    autophos = (auto_rows.loc[auto_rows["kinase"] != "", ["S", "kinase", "UniProt"]]
+                .rename(columns={"S": "site_id"}).drop_duplicates("site_id").sort_values("site_id"))
+    autophos.to_csv(out_autophos, index=False)
     ppi = pd.read_csv(PPI_CSV, dtype=str).fillna("")
     ppi_names = set(ppi["preferredName_A"].map(upper)) | set(ppi["preferredName_B"].map(upper))
     raw_names = sorted(set(n_edges) | ppi_names | set(seqs))
@@ -346,8 +415,10 @@ def main():
     rec = {}                                       # 原始名（含物种后缀的原样）-> dict
     for raw in raw_names:
         out = dict(raw_name=raw, canonical="", entity_type="unmapped", match_source="",
-                   family="", review=False, candidates="")
-        m = manual.get(raw)
+                   family="", species="", family_node="", members="", review=False, candidates="")
+        base, species = strip_species(raw)
+        out["species"] = species                    # 非人物种名去掉后缀后按人源同源基因处理
+        m = manual.get(raw, manual.get(base))
         if m is not None:                          # 0 人工对照
             syms, etype = manual_syms(m), upper(m.entity_type).lower()
             if not etype:
@@ -356,11 +427,6 @@ def main():
             out.update(canonical=next(iter(syms)) if len(syms) == 1 else "", entity_type=etype,
                        match_source="manual",
                        family=upper(m.family) or (family_span(syms) if etype == "group" else ""))
-            rec[raw] = out
-            continue
-        base, species = strip_species(raw)
-        if species and species != HUMAN_SUFFIX:    # 非人物种：不并入人激酶
-            out.update(entity_type="non_human", match_source=f"species:{species}")
             rec[raw] = out
             continue
         name = base
@@ -375,8 +441,9 @@ def main():
             syms = resolve_any(im.group(1))
             if syms:
                 src = "isoform"
-        if not syms and GROUP_SUFFIX_RE.search(name):               # 5 'PKC_GROUP'
-            out.update(entity_type="group", match_source="group_suffix")
+        if not syms and GROUP_SUFFIX_RE.search(name):               # 5 'PKC_GROUP'：家族键 = 去后缀后的名字
+            out.update(entity_type="group", match_source="group_suffix",
+                       family=upper(name[: -len("_GROUP")]))
             rec[raw] = out
             continue
         if not syms:                                                # 6 Manning 名
@@ -429,19 +496,16 @@ def main():
     # KinBase 对照规则，这里只按 HGNC 名称索引解析，单独给出三列（*_sym）。
     for n in raw_names:
         c, et, src = "", "unmapped", ""
-        base, species = strip_species(n)
-        if species and species != HUMAN_SUFFIX:
-            et, src = "non_human", f"species:{species}"
-        else:
-            syms, s0 = idx.resolve(base), idx.source_of(base)
-            if len(syms) > 1 and len(syms & kinome) == 1:
-                syms, s0 = syms & kinome, s0 + "+unique_kinase"
-            if len(syms) == 1:
-                c = next(iter(syms))
-                et, src = ("kinase" if c in kinome else "non_kinase"), s0
-            elif len(syms) > 1:
-                src = s0
-                et = "group" if (len(syms & kinome) == len(syms) and family_span(syms)) else "ambiguous"
+        base, _ = strip_species(n)
+        syms, s0 = idx.resolve(base), idx.source_of(base)
+        if len(syms) > 1 and len(syms & kinome) == 1:
+            syms, s0 = syms & kinome, s0 + "+unique_kinase"
+        if len(syms) == 1:
+            c = next(iter(syms))
+            et, src = ("kinase" if c in kinome else "non_kinase"), s0
+        elif len(syms) > 1:
+            src = s0
+            et = "group" if (len(syms & kinome) == len(syms) and family_span(syms)) else "ambiguous"
         rec[n].update(canonical_sym=c, entity_type_sym=et, match_source_sym=src)
 
     # ---------- 10 同序列证据：未解析的名字与已解析名字序列完全相同 ----------
@@ -452,7 +516,7 @@ def main():
             by_seq[s].add(rec[n]["canonical"])
     n_seq_merged = 0
     for n in raw_names:
-        if rec[n]["canonical"] or rec[n]["entity_type"] in ("non_kinase", "non_human", "other"):
+        if rec[n]["canonical"] or rec[n]["entity_type"] in ("non_kinase", "other", "autocatalysis"):
             continue
         targets = by_seq.get(seqs.get(n), set())
         if len(targets) == 1:
@@ -462,18 +526,34 @@ def main():
                           match_source=f"same_sequence:{others[0] if others else ''}")
             n_seq_merged += 1
 
+    # ---------- 泛称 -> 家族节点 ----------
+    # kinase_family_groups.csv 里定义了成员的家族才有节点（FAMILY_<家族>）；建图脚本用成员特征的
+    # 质心作节点特征，这些边只用于训练。没有定义成员的泛称不进图。
+    for out in rec.values():
+        key = out["family"]
+        if out["entity_type"] == "group" and key in fam_groups:
+            node = FAMILY_PREFIX + key
+            out.update(canonical=node, family_node=node, members=";".join(fam_groups[key]))
+
     # ---------- 输出 ----------
     alias = pd.DataFrame([rec[n] for n in raw_names])
     # 规范符号本身也入表（即使它从未作为原始名出现），保证查 info(规范名) 得到 (规范名, kinase)
     self_rows = [dict(raw_name=sym, canonical=sym, entity_type="kinase", match_source="symbol", family="",
+                      species="", family_node="", members="",
                       canonical_sym=sym, entity_type_sym="kinase", match_source_sym="symbol",
                       n_edges=0, in_ppi=False, has_seq=False, review=False, candidates="")
                  for sym in sorted(kinome) if sym not in rec]
+    # 家族节点本身也入表，提供建图脚本需要的成员列表
+    self_rows += [dict(raw_name=FAMILY_PREFIX + key, canonical=FAMILY_PREFIX + key, entity_type="group",
+                       match_source="family_node", family=key, species="", family_node=FAMILY_PREFIX + key,
+                       members=";".join(members), canonical_sym="", entity_type_sym="unmapped",
+                       match_source_sym="", n_edges=0, in_ppi=False, has_seq=False, review=False, candidates="")
+                  for key, members in sorted(fam_groups.items()) if FAMILY_PREFIX + key not in rec]
     alias = pd.concat([alias, pd.DataFrame(self_rows)], ignore_index=True)
     alias["n_edges"] = alias["raw_name"].map(lambda n: int(n_edges.get(n, 0)))
     alias["in_ppi"] = alias["raw_name"].isin(ppi_names)
     alias["has_seq"] = alias["raw_name"].isin(seqs)
-    cols = ["raw_name", "canonical", "entity_type", "match_source", "family",
+    cols = ["raw_name", "canonical", "entity_type", "match_source", "family", "family_node", "members", "species",
             "canonical_sym", "entity_type_sym", "match_source_sym",
             "n_edges", "in_ppi", "has_seq", "review", "candidates"]
     alias[cols].to_csv(out_alias, index=False)
@@ -491,21 +571,60 @@ def main():
           f"映射到现用符号的 {len(entries) - len(manning_unresolved)} 个")
     print(f"未能映射的 Manning 名 {len(manning_unresolved)} 个（以原名进家族表）:")
     print("  " + ", ".join(manning_unresolved))
-    print(f"激酶组成员 {len(kinome)} 个")
+    print(f"激酶组成员 {len(kinome)} 个 | 家族组定义 {len(fam_groups)} 个")
     k = alias[alias.raw_name.isin(n_edges)]
     print(f"\nKSR 表激酶名 {len(n_edges)} 个，唯一边 {len(ks_u)}，按实体类型：")
     for et, sub in k.groupby("entity_type"):
-        print(f"  {et:<11} 名字 {len(sub):>4} 个，边 {int(sub.n_edges.sum()):>6} 条")
+        print(f"  {et:<13} 名字 {len(sub):>4} 个，边 {int(sub.n_edges.sum()):>6} 条")
+
+    # 每条唯一边的去向（建图脚本按同样的规则处理）
+    spec_pairs = {(rec[n]["canonical"], s) for n, s in zip(ks_u.K, ks_u.S) if rec[n]["entity_type"] == "kinase"}
+    auto_map = dict(zip(autophos.site_id, autophos.kinase))
+
+    def fate(name, site):
+        r = rec[name]
+        t = r["entity_type"]
+        if t == "kinase":
+            return "特定激酶的边"
+        if t == "group":
+            return "家族层面的边（FAMILY 节点）" if r["family_node"] else "不进图：泛称没有家族定义"
+        if t == "autocatalysis":
+            g = auto_map.get(site, "")
+            if not g:
+                return "不进图：自磷酸化反推不出激酶"
+            return "自磷酸化边（与特异边重复，不新增）" if (g, site) in spec_pairs else "自磷酸化边（新增）"
+        if t in ("unmapped", "ambiguous"):
+            return "未解析（按原名成节点）"
+        return f"不进图：{t}"
+
+    fates = ks_u.apply(lambda r: fate(r.K, r.S), axis=1).value_counts()
+    dropped = int(sum(n for f, n in fates.items() if f.startswith("不进图")))
+    used = len(ks_u) - dropped - int(fates.get("自磷酸化边（与特异边重复，不新增）", 0))
+    print(f"\nKSR 唯一边的去向（进图 {used} 条 = {used / len(ks_u):.1%}；建图时还会剔除没有特征的激酶 / 位点）:")
+    for f, n in fates.items():
+        print(f"  {f:<28} {n:>6} 条  {n / len(ks_u):6.1%}")
+    print(f"自磷酸化: 唯一边 {len(auto_rows)} 条，反推出激酶 {len(autophos)} 条；"
+          f"反推不出的多因底物不是蛋白激酶。已写出: {out_autophos}")
+
+    def name_list(sub):
+        return ", ".join(f"{r.raw_name}({r.n_edges})" for r in sub.itertuples(index=False))
+
+    grp = k[k.entity_type == "group"]
+    fam_edges = grp[grp.family_node != ""].groupby("family_node").n_edges.sum().sort_values(ascending=False)
+    print(f"\n家族节点 {len(fam_edges)} 个，承接 {len(grp[grp.family_node != ''])} 个泛称名的 {int(fam_edges.sum())} 条边:")
+    for node, n in fam_edges.items():
+        members = fam_groups[node[len(FAMILY_PREFIX):]]
+        print(f"  {node:<16} 边 {n:>4}  成员 {len(members):>2}: " + "/".join(members)[:100])
+    none = grp[grp.family_node == ""].sort_values("n_edges", ascending=False)
+    if len(none):
+        print(f"没有家族定义、不进图的泛称 {len(none)} 个: " + name_list(none))
     print("\n按匹配来源（仅 kinase 类型）:")
     kin = alias[alias.entity_type == "kinase"].copy()
     kin["source_kind"] = kin["match_source"].str.split(":").str[0]
     for src, sub in kin.groupby("source_kind"):
         print(f"  {src:<28} 名字 {len(sub):>4} 个，边 {int(sub.n_edges.sum()):>6} 条")
 
-    def name_list(sub):
-        return ", ".join(f"{r.raw_name}({r.n_edges})" for r in sub.itertuples(index=False))
-
-    for et in ("non_kinase", "group", "other", "ambiguous"):
+    for et in ("non_kinase", "other", "ambiguous"):
         sub = k[k.entity_type == et].sort_values("n_edges", ascending=False)
         if len(sub):
             print(f"\n[{et}] KSR 中的名字 {len(sub)} 个（共 {int(sub.n_edges.sum())} 条边）:")
@@ -530,7 +649,7 @@ def main():
     print(f"\n合并了多个名字的激酶 {len(merged)} 个（括号为唯一边数；同序列补充解析 {n_seq_merged} 个名字）:")
     for canon, names in sorted(merged.items(), key=lambda kv: -sum(n_edges.get(n, 0) for n in kv[1])):
         print(f"  {canon:<10} <- " + ", ".join(f"{n}({n_edges.get(n, 0)})" for n in sorted(names)))
-    print(f"\n已写出: {out_alias}\n已写出: {out_family}")
+    print(f"\n已写出: {out_alias}\n已写出: {out_family}\n已写出: {out_autophos}")
 
 
 if __name__ == "__main__":

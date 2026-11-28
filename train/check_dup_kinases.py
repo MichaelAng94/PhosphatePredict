@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for p in (str(PROJECT_ROOT), str(Path(__file__).resolve().parent)):
@@ -48,16 +47,17 @@ def main():
     sim.fill_diagonal_(0.0)
     ei, ej = torch.where(torch.triu(sim > 0.999, diagonal=1))
     if len(ei):
-        # 复现训练脚本的 cold-start 划分（按激酶索引）
-        full_edge_index = data['kinase', 'phosphorylates', 'site'].edge_index
-        kinases_with_edges = np.unique(full_edge_index[0].cpu().numpy())
-        train_k, temp_k = train_test_split(
-            kinases_with_edges, test_size=0.3, random_state=RANDOM_SEED)
-        val_k, test_k = train_test_split(
-            temp_k, test_size=1/3, random_state=RANDOM_SEED)
-        tr, vl, te = set(train_k.tolist()), set(val_k.tolist()), set(test_k.tolist())
+        # 复现训练脚本的 cold-start 划分（按激酶索引）；家族层面边 / 自磷酸化边的处理
+        # 与训练脚本一致（data_prep/edge_levels.py）
+        from data_prep.edge_levels import read_edge_levels, split_edges
+        edge_level, family_members = read_edge_levels(data)
+        split = split_edges(data['kinase', 'phosphorylates', 'site'].edge_index, edge_level,
+                            num_kinase, RANDOM_SEED, 'kinase')
+        tr, vl, te = (set(split[k].tolist()) for k in ('train_k', 'val_k', 'test_k'))
 
         def role(i):
+            if family_members is not None and family_members[i]:
+                return 'family'      # 家族节点：成员特征的均值，与成员高度相似是设计使然，只进训练图
             if i in tr:
                 return 'train'
             if i in vl:

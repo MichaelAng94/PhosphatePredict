@@ -20,7 +20,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
-from sklearn.model_selection import train_test_split
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 for p in (str(PROJECT_ROOT), str(Path(__file__).resolve().parent)):
@@ -38,6 +37,9 @@ from train_hgt_trans import (
     PPI_RETRIEVAL_SIM,
 )
 from model.hgt_transformer import HGTTransformer
+from data_prep.edge_levels import (
+    apply_family_context, apply_train_edges, read_edge_levels, split_edges,
+)
 
 
 def build_protocol():
@@ -53,41 +55,39 @@ def build_protocol():
     full_edge_index = data['kinase', 'phosphorylates', 'site'].edge_index
     kinase_sites, site_kinases = build_true_edge_maps(full_edge_index)
 
-    # cold-start 按激酶划分（与训练脚本 SPLIT_MODE="kinase" 完全一致）
-    edge_kinases = full_edge_index[0].cpu().numpy()
-    kinases_with_edges = np.unique(edge_kinases)
-    train_k, temp_k = train_test_split(
-        kinases_with_edges, test_size=0.3, random_state=RANDOM_SEED
-    )
-    val_k, test_k = train_test_split(
-        temp_k, test_size=1/3, random_state=RANDOM_SEED
-    )
-    train_edge_index = full_edge_index[:, torch.as_tensor(
-        np.isin(edge_kinases, train_k), device=full_edge_index.device)].to(DEVICE)
-    val_edge_index = full_edge_index[:, torch.as_tensor(
-        np.isin(edge_kinases, val_k), device=full_edge_index.device)].to(DEVICE)
-    test_edge_index = full_edge_index[:, torch.as_tensor(
-        np.isin(edge_kinases, test_k), device=full_edge_index.device)].to(DEVICE)
+    # cold-start 按激酶划分（与训练脚本 SPLIT_MODE="kinase" 完全一致，含家族层面边 /
+    # 自磷酸化边的处理，统一在 data_prep/edge_levels.py）
+    edge_level, family_members = read_edge_levels(data)
+    edge_split = split_edges(full_edge_index, edge_level, num_kinase, RANDOM_SEED, 'kinase')
+    apply_family_context(kinase_sites, site_kinases, family_members, num_site)
+    train_edge_index = edge_split['train'].to(DEVICE)
+    val_edge_index = edge_split['val'].to(DEVICE)
+    test_edge_index = edge_split['test'].to(DEVICE)
+    train_k = edge_split['train_k']
 
-    # R1: 与训练脚本一致地构建检索谱先验（只用训练激酶/训练边，零泄漏）；
-    # R1.1 置信度调制参数必须与训练一致，否则注入的谱与训练期不同，指标不可比
-    train_kinase_mask = torch.as_tensor(np.isin(kinase_names, train_k))
+    # R1: 与训练脚本一致地构建检索谱先验（零泄漏）；R1.1 置信度调制参数必须与训练一致，
+    # 否则注入的谱与训练期不同，指标不可比。
+    # 相似边的来源 = 训练边涉及的激酶（含家族节点：其表示只由训练边计算）；
+    # 检索谱的来源 = 有特定激酶训练边的激酶（不含家族节点，与训练脚本一致）
+    knn_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=full_edge_index.device)
+    knn_kmask[train_edge_index[0]] = True
+    retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=full_edge_index.device)
+    retrieval_kmask[edge_split['train_specific'][0]] = True
     add_esm_knn_edges(
         data, ESM_KNN_K, ESM_SIM_MIN,
-        train_kinase_mask=train_kinase_mask.to(full_edge_index.device),
+        train_kinase_mask=knn_kmask.to(full_edge_index.device),
     )
     retrieval_log, _, _ = build_retrieval_profile(
-        data['kinase'].esm_x, train_kinase_mask.to(DEVICE), train_edge_index, num_site,
+        data['kinase'].esm_x, retrieval_kmask.to(DEVICE), train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
         conf_center=RETRIEVAL_CONF_CENTER, conf_temp=RETRIEVAL_CONF_TEMP,
         ppi_edge_index=data['kinase', 'ppis', 'kinase'].edge_index,
         ppi_sim=PPI_RETRIEVAL_SIM,
     )
 
-    # 嵌入只由训练边快照计算（与训练期评估一致，避免评估边泄漏）
+    # 嵌入只由训练边快照计算（与训练期评估一致，避免评估边泄漏）；边与 edge_level 一同替换
     train_data = data.clone()
-    train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
-    train_data['site', 'rev_phosphorylates', 'kinase'].edge_index = train_edge_index[[1, 0]]
+    apply_train_edges(train_data, train_edge_index, edge_split['train_level'])
 
     # 固定评估样本：与训练脚本相同 seed，保证逐边一致
     fixed_pairs = {}
@@ -104,9 +104,10 @@ def build_protocol():
     site_window = getattr(data['site'], 'window', None)
     motif_len = int(site_window.size(1)) if site_window is not None else 0
 
-    print(f"协议: cold-start 按激酶划分 | 训练激酶 {len(train_k)}, "
-          f"验证激酶 {len(val_k)}({val_edge_index.size(1)} 条边), "
-          f"测试激酶 {len(test_k)}({test_edge_index.size(1)} 条边) | "
+    print(f"协议: cold-start 按激酶划分 | 训练激酶 {len(train_k)}，验证激酶 {len(edge_split['val_k'])}"
+          f"({val_edge_index.size(1)} 条边), 测试激酶 {len(edge_split['test_k'])}({test_edge_index.size(1)} 条边) | "
+          f"训练边 {train_edge_index.size(1)} 条（特定激酶 {edge_split['train_specific'].size(1)}，"
+          f"家族层面 {edge_split['n_family']}，自磷酸化 {edge_split['n_auto']}）| "
           f"负采样 {NEG_STRATEGY} x5 | PR-AUC 随机基线 ≈ {1/6:.3f}")
     return (train_data, fixed_pairs, (esm_dim, n2v_dim, site_dim, num_families, motif_len,
             int(family_group_map.size(1))), family_group_map, retrieval_log)
@@ -152,7 +153,7 @@ def main():
         sys.exit(1)
 
     train_data, fixed_pairs, dims, family_group_map, retrieval_log = build_protocol()
-    esm_dim, n2v_dim, site_dim, num_families, motif_len, esmc_dim, num_groups = dims
+    esm_dim, n2v_dim, site_dim, num_families, motif_len, num_groups = dims
     # hidden_dim 从 checkpoint 自动推断（训练侧可能改动，如 256→128）
     state0 = torch.load(ckpt_paths[0], map_location=DEVICE, weights_only=False)
     hidden_dim = int(state0['family_classifier.0.weight'].shape[0])
@@ -161,7 +162,7 @@ def main():
         esm_dim=esm_dim, n2v_dim=n2v_dim, site_dim=site_dim,
         num_families=num_families, hidden_dim=hidden_dim, num_heads=4,
         num_hgt_layers=2, num_transformer_layers=1, dropout=0.2,
-        motif_len=motif_len, esmc_dim=esmc_dim,
+        motif_len=motif_len,
         num_groups=num_groups, family_group_map=family_group_map,
     ).to(DEVICE)
     # R1: 注入检索谱先验——与训练时一致；漏掉则 R1 分支在评估中静默缺失，指标不可比

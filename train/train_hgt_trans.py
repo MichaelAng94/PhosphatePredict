@@ -41,6 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from model.hgt_transformer import HGTTransformer
 from data_prep.kinase_names import KinaseNamer, load_family_table
+from data_prep.edge_levels import apply_family_context, apply_train_edges, read_edge_levels, split_edges
 from full_rank_eval import evaluate_full_candidate_ranking, format_full_rank_short
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -910,42 +911,31 @@ def main():
     logging.info(f"激酶分类 - 训练: {train_idx.size}, 验证: {val_idx.size}, 测试: {test_idx.size}")
     
     # ---- 边划分（链接预测任务）----
+    # 划分与边层级的处理统一放在 data_prep/edge_levels.py（eval_checkpoint.py 也用它复现协议）：
+    # cold-start 划分只针对特定激酶的注释；家族层面边、非评估激酶的自磷酸化边只进训练图
     full_edge_index = data['kinase', 'phosphorylates', 'site'].edge_index
-    # 全量正边索引（训练+验证+测试），负样本采样时据此过滤
+    edge_level, family_members = read_edge_levels(data)
+    split = split_edges(full_edge_index, edge_level, num_kinase, RANDOM_SEED, SPLIT_MODE)
+    train_edge_index = split['train']
+    val_edge_index = split['val']
+    test_edge_index = split['test']
+    # 全量正边索引（训练+验证+测试），负样本采样时据此过滤；
+    # 家族层面注释过的位点对同家族成员不作为负样本，评估时也从成员的候选里移出
     kinase_sites, site_kinases = build_true_edge_maps(full_edge_index)
-
+    family_keys, mask_sites = apply_family_context(kinase_sites, site_kinases, family_members, num_site)
     if SPLIT_MODE == "kinase":
-        # cold-start 划分：每个激酶的全部边进入同一子集，
-        # 验证/测试激酶在训练图中没有任何磷酸化边（暗激酶零样本条件）
-        edge_kinases = full_edge_index[0].cpu().numpy()
-        kinases_with_edges = np.unique(edge_kinases)
-        train_k, temp_k = train_test_split(
-            kinases_with_edges, test_size=0.3, random_state=RANDOM_SEED
-        )
-        val_k, test_k = train_test_split(
-            temp_k, test_size=1/3, random_state=RANDOM_SEED
-        )
-        train_edge_index = full_edge_index[:, torch.as_tensor(np.isin(edge_kinases, train_k), device=full_edge_index.device)]
-        val_edge_index = full_edge_index[:, torch.as_tensor(np.isin(edge_kinases, val_k), device=full_edge_index.device)]
-        test_edge_index = full_edge_index[:, torch.as_tensor(np.isin(edge_kinases, test_k), device=full_edge_index.device)]
         logging.info(
-            f"链接预测 - 按激酶划分(cold-start): 训练激酶 {len(train_k)}, 验证激酶 {len(val_k)}, 测试激酶 {len(test_k)} | "
-            f"训练边: {train_edge_index.size(1)}, 验证边: {val_edge_index.size(1)}, 测试边: {test_edge_index.size(1)}"
+            f"链接预测 - 按激酶划分(cold-start): 训练激酶 {len(split['train_k'])}, 验证激酶 {len(split['val_k'])}, "
+            f"测试激酶 {len(split['test_k'])} | 训练边: {train_edge_index.size(1)}（特定激酶 {split['train_specific'].size(1)}，"
+            f"家族层面 {split['n_family']}，自磷酸化 {split['n_auto']}）, 验证边: {val_edge_index.size(1)}, "
+            f"测试边: {test_edge_index.size(1)}"
         )
     else:
-        # 旧协议：按边随机划分（transductive，仅用于对照）
-        edge_indices = np.arange(full_edge_index.size(1))
-        train_edge_idx, temp_edge_idx = train_test_split(
-            edge_indices, test_size=0.3, random_state=RANDOM_SEED
-        )
-        val_edge_idx, test_edge_idx = train_test_split(
-            temp_edge_idx, test_size=1/3, random_state=RANDOM_SEED
-        )
-        train_edge_index = full_edge_index[:, train_edge_idx]
-        val_edge_index = full_edge_index[:, val_edge_idx]
-        test_edge_index = full_edge_index[:, test_edge_idx]
         logging.info(f"链接预测 - 按边划分: 训练边: {train_edge_index.size(1)}, 验证边: {val_edge_index.size(1)}, 测试边: {test_edge_index.size(1)}")
-    
+    if any(x is not None for x in mask_sites):
+        logging.info(f"家族层面注释: {sum(x is not None for x in mask_sites)} 个激酶在评估时移除所属家族的家族层面位点"
+                     "（既不算正例也不算负例）")
+
     # P2-B1: ESM-kNN 相似激酶边（仅用序列特征，无标注泄漏），必须在 clone 前加到 data：
     # 冷启动激酶经此从序列相似的训练激酶继承底物特异性
     # 与链接预测训练边严格对齐：val/test 激酶只能从训练激酶检索相似边
@@ -961,10 +951,11 @@ def main():
 
     # R1: 检索式底物谱先验——每个激酶按 ESM 相似度检索 top-m 训练激酶，
     # softmax 加权累加其训练底物谱（只用训练激酶/训练边，零标注泄漏）。
-    # 检索源 = 链接预测训练边涉及的激酶（train_edge_index 的行），而非分类掩码——
-    # 分类划分与边划分相互独立，谱的支撑面必须与训练边严格对齐
+    # 检索源 = 有特定激酶训练边的激酶（split['train_specific'] 的行），而非分类掩码——
+    # 分类划分与边划分相互独立，谱的支撑面必须与训练边严格对齐。
+    # 家族节点不作检索源：它的底物都是家族层面位点，对成员既不计正也不计负
     retrieval_kmask = torch.zeros(num_kinase, dtype=torch.bool, device=train_edge_index.device)
-    retrieval_kmask[train_edge_index[0]] = True
+    retrieval_kmask[split['train_specific'][0]] = True
     retrieval_log, retrieval_raw, retrieval_conf = build_retrieval_profile(
         data['kinase'].esm_x, retrieval_kmask, train_edge_index, num_site,
         top_m=RETRIEVAL_TOP_M, tau=RETRIEVAL_TAU, scale=RETRIEVAL_SCALE,
@@ -994,8 +985,8 @@ def main():
         f"{n}={retrieval_conf[_kname_list.index(n)]:.3f}" for n in _diag))
 
     train_data = data.clone()
-    train_data['kinase', 'phosphorylates', 'site'].edge_index = train_edge_index
-    train_data['site', 'rev_phosphorylates', 'kinase'].edge_index = train_edge_index[[1,0]]
+    # 训练图快照：正向 / 反向边与 edge_level 一同换成训练边的（见 data_prep/edge_levels.py）
+    apply_train_edges(train_data, train_edge_index, split['train_level'])
 
     # 将划分掩码和边索引移到设备
     train_kinase_mask = train_kinase_mask.to(DEVICE)
@@ -1058,6 +1049,8 @@ def main():
     # 全量真边键（k*num_site+s，排序数组，供 L4 批内负样本 O(log n) 过滤）
     _fk = full_edge_index.cpu().numpy()
     true_edge_keys = np.unique(_fk[0].astype(np.int64) * num_site + _fk[1])
+    if len(family_keys):   # (成员 / 家族节点, 相关位点)：批内对比损失与检索谱反污染也不把它们当负样本
+        true_edge_keys = np.unique(np.concatenate([true_edge_keys, family_keys]))
     # 正边采样权重 ∝ 1/deg_train(kinase)^DEGREE_ALPHA（稀有激酶过采样）
     _ek = train_edge_index[0].cpu().numpy()
     train_deg = np.bincount(_ek, minlength=num_kinase).astype(np.float64)
@@ -1163,6 +1156,7 @@ def main():
                     model, train_data, val_edge_index, num_site,
                     kinase_labels=kinase_labels, family_names=family_names,
                     kinase_names=kinase_names, split_name='val', verbose=False,
+                    mask_sites=mask_sites,
                 )
                 logging.info(f"  [全候选/val] {format_full_rank_short(fr_val, 'val')}")
 
@@ -1215,7 +1209,8 @@ def main():
         fr_final[split_name] = evaluate_full_candidate_ranking(
             model, train_data, eidx, num_site,
             kinase_labels=kinase_labels, family_names=family_names,
-            kinase_names=kinase_names, split_name=split_name, verbose=True
+            kinase_names=kinase_names, split_name=split_name, verbose=True,
+            mask_sites=mask_sites,
         )
     fr_t = fr_final.get('test') or {}
     if fr_t:

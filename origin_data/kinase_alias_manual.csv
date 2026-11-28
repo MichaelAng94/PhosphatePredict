@@ -1,95 +1,123 @@
 raw_name,canonical,entity_type,group,family,subfamily,note
-ACTR2,ACVR2A,kinase,,,,"Manning ACTR2=activin receptor IIA；HGNC ACTR2=actin related protein 2"
-ACTR2B,ACVR2B,kinase,,,,"Manning ACTR2B=activin receptor IIB"
-MST1,STK4,kinase,,,,"Manning MST1=mammalian STE20-like kinase 1；HGNC MST1=macrophage stimulating 1"
-MYT1,PKMYT1,kinase,,,,"Manning MYT1=membrane-associated tyrosine/threonine kinase；HGNC MYT1=myelin transcription factor 1（FASTA 中两者序列相同）"
-GCK,MAP4K2,kinase,,,,"Manning GCK=germinal center kinase；HGNC GCK=glucokinase"
-PDK1,PDPK1,kinase,,,,"Manning PDK1=phosphoinositide-dependent kinase 1；HGNC PDK1=pyruvate dehydrogenase kinase 1（对应 Manning 的 PDHK1）"
-PKD1,PRKD1,kinase,,,,"Manning PKD1=protein kinase D1；HGNC PKD1=polycystin 1"
-PKD2,PRKD2,kinase,,,,"Manning PKD2=protein kinase D2；HGNC PKD2=polycystin 2"
-OSR1,OXSR1,kinase,,,,"Manning OSR1=oxidative stress-responsive kinase 1；HGNC OSR1=odd-skipped related transcription factor 1"
-SRM,SRMS,kinase,,,,"Manning SRM（Src 家族）=SRMS；HGNC SRM=spermidine synthase"
-CAMK1A,CAMK1,kinase,,,,"KinBase CAMK1A=CaMKI alpha（HGNC CAMK1 未收该别名）"
-CK1D,CSNK1D,kinase,,,,"KinBase CK1D=casein kinase 1 delta"
-CK1E,CSNK1E,kinase,,,,"KinBase CK1E=casein kinase 1 epsilon"
-CK1G1,CSNK1G1,kinase,,,,"KinBase CK1G1=casein kinase 1 gamma 1"
-CK1G3,CSNK1G3,kinase,,,,"KinBase CK1G3=casein kinase 1 gamma 3"
-CK1A2,CSNK1A1L,kinase,,,,"KinBase CK1A2=casein kinase 1 alpha-like 2"
-DMPK1,DMPK,kinase,,,,"Manning 表把 DMPK 的两个亚型列成了两条"
-DMPK2,DMPK,kinase,,,,"同上"
-FUSED,STK36,kinase,,,,"KinBase FUSED=fused homolog（STK36）"
-P38A,MAPK14,kinase,,,,"KinBase P38A=p38 alpha"
-P38B,MAPK11,kinase,,,,"KinBase P38B=p38 beta"
-P70S6K,RPS6KB1,kinase,,,,"KinBase P70S6K=p70 S6 kinase alpha（RPS6KB1）"
-PKCD,PRKCD,kinase,,,,"KinBase PKCD=PKC delta"
-PKCT,PRKCQ,kinase,,,,"KinBase PKCT=PKC theta"
-PKCH,PRKCH,kinase,,,,"KinBase PKCH=PKC eta"
-PKCZ,PRKCZ,kinase,,,,"KinBase PKCZ=PKC zeta"
-PDHK1,PDK1,kinase,,,,"KinBase PDHK1=pyruvate dehydrogenase kinase 1（HGNC 符号 PDK1）"
-KHS2,MAP4K3,kinase,,,,"KinBase KHS2=kinase homologous to SPS1/Ste20 2（MAP4K3/GLK）"
-TAO3,TAOK3,kinase,,,,"KinBase TAO3=TAO kinase 3"
-IRE2,ERN2,kinase,,,,"KinBase IRE2=inositol-requiring enzyme 2"
-SIK,SIK1,kinase,,,,"KinBase SIK=salt-inducible kinase（SIK1）"
-ALPHAK1,ALPK1,kinase,,,,"KinBase ALPHAK1=alpha kinase 1"
-ALPHAK2,ALPK2,kinase,,,,"KinBase ALPHAK2=alpha kinase 2"
-ALPHAK3,ALPK3,kinase,,,,"KinBase ALPHAK3=alpha kinase 3"
-ARG,ABL2,kinase,,,,"Manning ARG=Abelson-related gene；别名同时命中 RERE（非激酶）"
-PRP4,PRP4K,kinase,,,,"Manning PRP4=PRP4 kinase；别名同时命中 PRPF4（剪接因子）"
-PITSLRE,CDK11A;CDK11B,group,CMGC,CDK,PITSLRE,"Manning PITSLRE 条目对应 CDK11A 与 CDK11B 两个基因；KSR 里的 PITSLRE 无法区分归为泛称"
-GRK7,GRK7,kinase,AGC,GRK,,"Manning 2002 未收的 GRK 家族成员"
-SRMS,SRMS,kinase,TK,Src,,"Manning 之后命名的 Src 家族相关激酶"
-FAM20C,FAM20C,kinase,Atypical,FAM20C,,"高尔基体分泌型蛋白激酶（2012 年报道）"
-SDK1,SBK1,kinase,,,,"KSR 的 SDK1=SH3 domain binding kinase 1（旧名 SDK1）；HGNC SDK1=sidekick cell adhesion molecule 1"
-CK2A,CSNK2A1,kinase,,,,"Phospho.ELM 的 CK2A=CK2 alpha（CSNK2A1；alpha prime 另记为 CK2A2）"
-CK2 ALPHA,CSNK2A1,kinase,,,,"同上"
-CK2_ALPHA,CSNK2A1,kinase,,,,"同上"
-CK2B,CSNK2B,non_kinase,,,,"CK2 beta 是调节亚基，无催化活性"
-CK2_BETA,CSNK2B,non_kinase,,,,"同上"
-CK2 BETA,CSNK2B,non_kinase,,,,"同上"
-PKA ALPHA,PRKACA,kinase,,,,"PKA catalytic alpha"
-PKA_ALPHA,PRKACA,kinase,,,,"同上"
-AURORA B,AURKB,kinase,,,,""
-AURORA A,AURKA,kinase,,,,""
-CAM-KK_ALPHA,CAMKK1,kinase,,,,"CaM kinase kinase alpha"
-DSDNA KINASE,PRKDC,kinase,,,,"dsDNA kinase=DNA-PK catalytic subunit"
-PDK-1,PDPK1,kinase,,,,"文献中的 PDK-1=3-phosphoinositide-dependent protein kinase 1"
-ILK1,ILK,kinase,,,,"integrin-linked kinase"
-NIK,MAP3K14,kinase,,,,"NF-kB-inducing kinase；别名同时命中 MAP4K4（Nck-interacting kinase）"
-ALK1,ACVRL1,kinase,,,,"activin receptor-like kinase 1；别名同时命中 ALK"
-MINK,MINK1,kinase,,,,"别名同时命中 KCNE1（钾通道）"
-PHK,,group,CAMK,PHK,,"phosphorylase kinase 全酶；催化亚基是 PHKG1/PHKG2（PHKA1/PHKB 为调节亚基）"
-GSK3,,group,CMGC,GSK,,"未区分 GSK3A / GSK3B"
-CDC42BP,,group,CAMK,MRCK,,"未区分 CDC42BPA / CDC42BPB"
-CK,,group,,,,"未写明哪一类"
-MAP2K,,group,STE,STE7,,"MAPK kinase 泛称"
-MAP3K,,group,STE,STE11,,"MAPK kinase kinase 泛称"
-TYR-KINASES,,group,TK,,,"酪氨酸激酶泛称"
-SRC-TYPE TYR-KINASES,,group,TK,Src,,"Src 家族泛称"
-AUTOCATALYSIS,,other,,,,"自磷酸化：激酶就是底物蛋白自身，无法按名字归属到节点"
-PDK-2,,other,,,,"文献中的 PDK-2 指疏水基序激酶活性，身份不一"
-LEGIONELLA ANKX,,other,,,,"军团菌效应蛋白"
-BCR-ABL1,,other,,,,"融合蛋白"
-NPM-ALK,,other,,,,"融合蛋白"
-IN FORMPHOSPHORYLASE A,,other,,,,"Phospho.ELM 的注释文字，不是激酶名"
-INISOFORM HMG-I,,other,,,,"同上"
-ISOFORM HMG-Y,,other,,,,"同上"
-DEPENDENT ON Y-167,,other,,,,"同上"
-HOST,,other,,,,"同上"
-ALTERNATE,,other,,,,"同上"
-CHED,CDK13,kinase,,,,"Manning CHED（CDK/CRK7 亚家族）=CDK13；别名同时命中 OVOL2"
-NDR1,STK38,kinase,,,,"NDR1=nuclear Dbf2-related 1（STK38）；别名同时命中 NDRG1"
-TAO1,TAOK1,kinase,,,,"TAO1=TAO kinase 1；别名同时命中 TAOK2（TAO2）"
-TRB1,TRIB1,kinase,,,,"Tribbles 1；别名同时命中味觉受体基因 TAS2R14"
-TRB2,TRIB2,kinase,,,,"Tribbles 2"
-TRB3,TRIB3,kinase,,,,"Tribbles 3"
-ZC3/MINK,MINK1,kinase,,,,"Manning ZC3/MINK=misshapen-like kinase 1（MAP4K6）"
-GPRK7,GRK7,kinase,,,,"Manning GPRK7=GRK7；HGNC 把 GPRK7 同时列为 GRK7 与 MKNK2 的旧符号"
-PKG1A/CGK-IALPHA,PRKG1,kinase,,,,"PKG1a / cGK-I alpha 是 PRKG1 的亚型"
-PKG1B/CGK-IBETA,PRKG1,kinase,,,,"PKG1beta / cGK-I beta 是 PRKG1 的亚型"
-AMPKG2,PRKAG2,kinase,,,,"KinBase AMPKG2=AMPK gamma 2"
-AMPKB1,PRKAB1,kinase,,,,"KinBase AMPKB1=AMPK beta 1"
-PKB BETA,AKT2,kinase,,,,"PKB beta=AKT2"
-PKB_BETA,AKT2,kinase,,,,"同上"
-CK2-B,CSNK2B,non_kinase,,,,"CK2 beta 是调节亚基"
-PAK,,group,STE,STE20,,"p21-activated kinase 泛称（PAKA/PAKB 两个亚家族）"
-JAK,,group,TK,,,"Janus kinase 泛称"
+ACTR2,ACVR2A,kinase,,,,Manning ACTR2=activin receptor IIA；HGNC ACTR2=actin related protein 2
+ACTR2B,ACVR2B,kinase,,,,Manning ACTR2B=activin receptor IIB
+MST1,STK4,kinase,,,,Manning MST1=mammalian STE20-like kinase 1；HGNC MST1=macrophage stimulating 1
+MYT1,PKMYT1,kinase,,,,Manning MYT1=membrane-associated tyrosine/threonine kinase；HGNC MYT1=myelin transcription factor 1（FASTA 中两者序列相同）
+GCK,MAP4K2,kinase,,,,Manning GCK=germinal center kinase；HGNC GCK=glucokinase
+PDK1,PDPK1,kinase,,,,Manning PDK1=phosphoinositide-dependent kinase 1；HGNC PDK1=pyruvate dehydrogenase kinase 1（对应 Manning 的 PDHK1）
+PKD1,PRKD1,kinase,,,,Manning PKD1=protein kinase D1；HGNC PKD1=polycystin 1
+PKD2,PRKD2,kinase,,,,Manning PKD2=protein kinase D2；HGNC PKD2=polycystin 2
+OSR1,OXSR1,kinase,,,,Manning OSR1=oxidative stress-responsive kinase 1；HGNC OSR1=odd-skipped related transcription factor 1
+SRM,SRMS,kinase,,,,Manning SRM（Src 家族）=SRMS；HGNC SRM=spermidine synthase
+CAMK1A,CAMK1,kinase,,,,KinBase CAMK1A=CaMKI alpha（HGNC CAMK1 未收该别名）
+CK1D,CSNK1D,kinase,,,,KinBase CK1D=casein kinase 1 delta
+CK1E,CSNK1E,kinase,,,,KinBase CK1E=casein kinase 1 epsilon
+CK1G1,CSNK1G1,kinase,,,,KinBase CK1G1=casein kinase 1 gamma 1
+CK1G3,CSNK1G3,kinase,,,,KinBase CK1G3=casein kinase 1 gamma 3
+CK1A2,CSNK1A1L,kinase,,,,KinBase CK1A2=casein kinase 1 alpha-like 2
+DMPK1,DMPK,kinase,,,,Manning 表把 DMPK 的两个亚型列成了两条
+DMPK2,DMPK,kinase,,,,同上
+FUSED,STK36,kinase,,,,KinBase FUSED=fused homolog（STK36）
+P38A,MAPK14,kinase,,,,KinBase P38A=p38 alpha
+P38B,MAPK11,kinase,,,,KinBase P38B=p38 beta
+P70S6K,RPS6KB1,kinase,,,,KinBase P70S6K=p70 S6 kinase alpha（RPS6KB1）
+PKCD,PRKCD,kinase,,,,KinBase PKCD=PKC delta
+PKCT,PRKCQ,kinase,,,,KinBase PKCT=PKC theta
+PKCH,PRKCH,kinase,,,,KinBase PKCH=PKC eta
+PKCZ,PRKCZ,kinase,,,,KinBase PKCZ=PKC zeta
+PDHK1,PDK1,kinase,,,,KinBase PDHK1=pyruvate dehydrogenase kinase 1（HGNC 符号 PDK1）
+KHS2,MAP4K3,kinase,,,,KinBase KHS2=kinase homologous to SPS1/Ste20 2（MAP4K3/GLK）
+TAO3,TAOK3,kinase,,,,KinBase TAO3=TAO kinase 3
+IRE2,ERN2,kinase,,,,KinBase IRE2=inositol-requiring enzyme 2
+SIK,SIK1,kinase,,,,KinBase SIK=salt-inducible kinase（SIK1）
+ALPHAK1,ALPK1,kinase,,,,KinBase ALPHAK1=alpha kinase 1
+ALPHAK2,ALPK2,kinase,,,,KinBase ALPHAK2=alpha kinase 2
+ALPHAK3,ALPK3,kinase,,,,KinBase ALPHAK3=alpha kinase 3
+ARG,ABL2,kinase,,,,Manning ARG=Abelson-related gene；别名同时命中 RERE（非激酶）
+PRP4,PRP4K,kinase,,,,Manning PRP4=PRP4 kinase；别名同时命中 PRPF4（剪接因子）
+CHED,CDK13,kinase,,,,Manning CHED（CDK/CRK7 亚家族）=CDK13；别名同时命中 OVOL2
+NDR1,STK38,kinase,,,,NDR1=nuclear Dbf2-related 1（STK38）；别名同时命中 NDRG1
+TAO1,TAOK1,kinase,,,,TAO1=TAO kinase 1；别名同时命中 TAOK2（TAO2）
+TRB1,TRIB1,kinase,,,,Tribbles 1；别名同时命中味觉受体基因 TAS2R14
+TRB2,TRIB2,kinase,,,,Tribbles 2
+TRB3,TRIB3,kinase,,,,Tribbles 3
+ZC3/MINK,MINK1,kinase,,,,Manning ZC3/MINK=misshapen-like kinase 1（MAP4K6）
+GPRK7,GRK7,kinase,,,,Manning GPRK7=GRK7；HGNC 把 GPRK7 同时列为 GRK7 与 MKNK2 的旧符号
+PKG1A/CGK-IALPHA,PRKG1,kinase,,,,PKG1a / cGK-I alpha 是 PRKG1 的亚型
+PKG1B/CGK-IBETA,PRKG1,kinase,,,,PKG1beta / cGK-I beta 是 PRKG1 的亚型
+AMPKG2,PRKAG2,kinase,,,,KinBase AMPKG2=AMPK gamma 2
+AMPKB1,PRKAB1,kinase,,,,KinBase AMPKB1=AMPK beta 1
+PKB BETA,AKT2,kinase,,,,PKB beta=AKT2
+PKB_BETA,AKT2,kinase,,,,同上
+GRK7,GRK7,kinase,AGC,GRK,,Manning 2002 未收的 GRK 家族成员
+SRMS,SRMS,kinase,TK,SRC,,Manning 之后命名的 Src 家族相关激酶
+FAM20C,FAM20C,kinase,Atypical,FAM20C,,高尔基体分泌型蛋白激酶（2012 年报道）
+SDK1,SBK1,kinase,,,,KSR 的 SDK1=SH3 domain binding kinase 1（旧名 SDK1）；HGNC SDK1=sidekick cell adhesion molecule 1
+CK2A,CSNK2A1,kinase,,,,Phospho.ELM 的 CK2A=CK2 alpha（CSNK2A1；alpha prime 另记为 CK2A2）
+CK2 ALPHA,CSNK2A1,kinase,,,,同上
+CK2_ALPHA,CSNK2A1,kinase,,,,同上
+PKA ALPHA,PRKACA,kinase,,,,PKA catalytic alpha
+PKA_ALPHA,PRKACA,kinase,,,,同上
+AURORA B,AURKB,kinase,,,,
+AURORA A,AURKA,kinase,,,,
+CAM-KK_ALPHA,CAMKK1,kinase,,,,CaM kinase kinase alpha
+DSDNA KINASE,PRKDC,kinase,,,,dsDNA kinase=DNA-PK catalytic subunit
+PDK-1,PDPK1,kinase,,,,文献中的 PDK-1=3-phosphoinositide-dependent protein kinase 1
+ILK1,ILK,kinase,,,,integrin-linked kinase
+NIK,MAP3K14,kinase,,,,NF-kB-inducing kinase；别名同时命中 MAP4K4（Nck-interacting kinase）
+ALK1,ACVRL1,kinase,,,,activin receptor-like kinase 1；别名同时命中 ALK
+MINK,MINK1,kinase,,,,别名同时命中 KCNE1（钾通道）
+GSK3B_GROUP,GSK3B,kinase,,,,只对应一个基因
+DMPK_GROUP,DMPK,kinase,,,,只对应一个基因
+TOR,MTOR,kinase,,,,果蝇 TOR 的人源同源基因
+CAKI,CDK7,kinase,,,,果蝇的 Cdk-activating kinase
+MLCK,MYLK,kinase,,,,myosin light chain kinase
+LIT-1,NLK,kinase,,,,线虫 lit-1 是 NLK 的同源基因
+PITSLRE,,group,,PITSLRE,,Manning PITSLRE 条目对应 CDK11A 与 CDK11B 两个基因；成员见 kinase_family_groups.csv
+PHK,,group,,PHK,,phosphorylase kinase 全酶；催化亚基是 PHKG1/PHKG2
+PHKA1,,group,,PHK,,磷酸化酶激酶 alpha1 是调节亚基，以它命名的注释按全酶处理
+GSK3,,group,,GSK3,,未区分 GSK3A / GSK3B
+GSK-3,,group,,GSK3,,同上（GSK-3_CAEEL 去物种后缀后的名字）
+SGG,,group,,GSK3,,果蝇 shaggy 是 GSK3 的同源基因
+GSK-3_GROUP,,group,,GSK3,,与 GSK3_GROUP 是同一家族
+CDC42BP,,group,,CDC42BP,,未区分 CDC42BPA / CDC42BPB
+CK2B,,group,,CK2,,CK2 beta 是调节亚基，以它命名的注释按 CK2 全酶处理
+CK2_BETA,,group,,CK2,,同上
+CK2 BETA,,group,,CK2,,同上
+CK2-B,,group,,CK2,,同上
+CKII_BETA,,group,,CK2,,同上（果蝇）
+CKII_GROUP,,group,,CK2,,CKII 即 CK2
+PRKAR1A,,group,,PKA,,PKA 调节亚基，以它命名的注释按 PKA 全酶处理
+PRKAR2A,,group,,PKA,,同上
+PRKAR2B,,group,,PKA,,同上
+PKA-C1,,group,,PKA,,果蝇 Pka-C1 是 PKA 催化亚基的同源基因
+CAM-KII_GROUP,,group,,CAMK2,,CaM-KII 即 CAMK2
+CAMKII,,group,,CAMK2,,同上（果蝇）
+UNC-43,,group,,CAMK2,,线虫 unc-43 是 CaMKII 的同源基因
+CAM-KI_GROUP,,group,,CAMK1,,CaM-KI 即 CAMK1
+PKG/CGK_GROUP,,group,,PKG,,与 PKG_GROUP 是同一家族
+MAP2K,,group,,MAP2K,,MAPK kinase 泛称
+MAP3K,,group,,MAP3K,,MAPK kinase kinase 泛称
+PAK,,group,,PAK,,p21-activated kinase 泛称
+JAK,,group,,JAK,,Janus kinase 泛称
+HOP,,group,,JAK,,果蝇 hopscotch 是 JAK 的同源基因
+BTK_GROUP,,group,,TEC,,Tec 家族（BTK、BMX、ITK、TEC、TXK）
+TYR-KINASES,,group,,TK,,酪氨酸激酶泛称
+SRC-TYPE TYR-KINASES,,group,,SRC,,Src 家族泛称
+SRC64B,,group,,SRC,,果蝇 Src64B 是 Src 的同源基因
+CKI_ALPHA,,group,,CK1,,casein kinase I alpha 泛称
+CK,,group,,,,未写明哪一类激酶，没有对应的家族定义
+CAMK,,group,,,,范围过宽（整个 CAMK 大类），没有对应的家族定义
+AUTOCATALYSIS,,autocatalysis,,,,自磷酸化：激酶就是底物蛋白自身，由 build_kinase_alias_map.py 按底物的 UniProt 反推到具体激酶；反推不出的不进图
+PDK-2,,other,,,,文献中的 PDK-2 指疏水基序激酶活性，身份不一
+LEGIONELLA ANKX,,other,,,,军团菌效应蛋白
+BCR-ABL1,,other,,,,融合蛋白
+NPM-ALK,,other,,,,融合蛋白
+BCR/ABL,,other,,,,融合蛋白
+IN FORMPHOSPHORYLASE A,,other,,,,Phospho.ELM 的注释文字，不是激酶名
+INISOFORM HMG-I,,other,,,,同上
+ISOFORM HMG-Y,,other,,,,同上
+DEPENDENT ON Y-167,,other,,,,同上
+HOST,,other,,,,同上
+ALTERNATE,,other,,,,同上
+CSNK2B,,group,,CK2,,CK2 beta 是调节亚基，以它命名的注释按 CK2 全酶处理

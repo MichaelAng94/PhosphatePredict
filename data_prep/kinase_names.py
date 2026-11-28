@@ -17,12 +17,15 @@ data_prep/build_kinase_alias_map.py 生成（origin_data/kinase_alias_map.csv）
 
 kinase_alias_map.csv 列:
     raw_name          原始名（大写，与建图/训练的归一口径一致）
-    canonical         规范名（kinbase 语义）；泛称/歧义/未解析时为空
-    entity_type       kinase | group | non_kinase | non_human | other | ambiguous | unmapped
+    canonical         规范名（kinbase 语义）；泛称指向家族节点 FAMILY_<家族>；歧义/未解析/自磷酸化时为空
+    entity_type       kinase | group | autocatalysis | non_kinase | other | ambiguous | unmapped
+    family            泛称所属的家族组（kinase_family_groups.csv 的 group_key）
+    family_node       泛称对应的家族节点名（没有成员定义的泛称为空）
+    members           家族节点的成员列表（';' 分隔）
+    species           原始名所带的物种后缀（已去掉后缀后解析）
     canonical_sym     规范名（现用符号语义）
     entity_type_sym   实体类型（现用符号语义）
     match_source      匹配依据
-    family            泛称所指的 Manning 家族（仅 group 有值）
     review            True 表示需人工核对
 """
 
@@ -36,9 +39,15 @@ FAMILY_TABLE_PATH = str(PROJECT_ROOT / "origin_data/kinase_family.csv")
 
 SEMANTICS = ("kinbase", "symbol")
 
-# 建图时排除的实体类型：不是"某一个具体的人蛋白激酶"，其边无法归属到规范激酶。
-# ambiguous / unmapped 不排除——保持与旧图一致（按原名成节点），只是标记出来待核对。
-EXCLUDED_ENTITY_TYPES = ("group", "non_kinase", "non_human", "other")
+# 家族节点的名字前缀（如 FAMILY_PKA）：承接"某个 PKA 磷酸化"这类家族层面的注释，
+# 只用于训练，见 data_prep/edge_levels.py。
+FAMILY_PREFIX = "FAMILY_"
+
+# 建图时不直接成 kinase 节点的实体类型：
+#   non_kinase / other  没法当作蛋白激酶-底物关系；
+#   autocatalysis       激酶就是底物蛋白自身，由建图脚本按位点查 kinase_autophos_map.csv 反推；
+#   group               若没有对应的家族节点（canonical 为空）也不进图。
+EXCLUDED_ENTITY_TYPES = ("non_kinase", "other", "autocatalysis")
 
 
 def upper_name(raw) -> str:
@@ -51,6 +60,9 @@ class KinaseNamer:
 
     def __init__(self, alias_map: pd.DataFrame):
         df = alias_map.copy()
+        for col in ("family_node", "members"):
+            if col not in df.columns:
+                df[col] = ""
         df["raw_name"] = df["raw_name"].map(upper_name)
         self.has_symbol_semantics = {"canonical_sym", "entity_type_sym"} <= set(df.columns)
         if self.has_symbol_semantics:
@@ -95,6 +107,22 @@ class KinaseNamer:
         col = "canonical_sym" if (semantics == "symbol" and self.has_symbol_semantics) else "canonical"
         rows = self.table[self.table[col] == upper_name(canonical)]
         return sorted(set(rows.index) | {upper_name(canonical)})
+
+    def is_family_node(self, node) -> bool:
+        name = upper_name(node)
+        return bool(name) and name in self.table.index and self.table.loc[name, "canonical"] == name \
+            and self.table.loc[name, "entity_type"] == "group"
+
+    def family_members(self, node) -> tuple:
+        """家族节点的成员 HGNC 符号（排序）；不是家族节点时返回空元组。"""
+        if not self.is_family_node(node):
+            return ()
+        return tuple(x for x in str(self.table.loc[upper_name(node), "members"]).split(";") if x)
+
+    def family_nodes(self) -> dict:
+        """全部家族节点：{节点名: (成员符号…)}。"""
+        sub = self.table[self.table.apply(lambda r: r["entity_type"] == "group" and r["canonical"] == r.name, axis=1)]
+        return {n: tuple(x for x in str(m).split(";") if x) for n, m in zip(sub.index, sub["members"])}
 
 
 def load_family_table(path: str = FAMILY_TABLE_PATH) -> pd.DataFrame:
